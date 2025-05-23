@@ -4,14 +4,14 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import structlog
-import aioredis
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 
-from ..exchanges.manager import exchange_manager
-from ..config import settings
-from ..utils.rabbitmq import RabbitMQPublisher
+from exchanges.manager import exchange_manager
+from config import settings
+from utils.rabbitmq import RabbitMQPublisher
 
 
 class OrderbookProcessor:
@@ -19,7 +19,7 @@ class OrderbookProcessor:
 
     def __init__(self):
         self.logger = structlog.get_logger().bind(component="orderbook_processor")
-        self.redis_client: Optional[aioredis.Redis] = None
+        self.redis_client: Optional[redis.Redis] = None
         self.db_engine = None
         self.session_factory = None
         self.rabbitmq_publisher: Optional[RabbitMQPublisher] = None
@@ -48,7 +48,7 @@ class OrderbookProcessor:
             )
 
             # Initialize Redis
-            self.redis_client = aioredis.from_url(
+            self.redis_client = redis.from_url(
                 f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
             )
 

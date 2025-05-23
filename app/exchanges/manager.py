@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from .factory import ExchangeFactory
 from .base import ExchangeAdapter, ConnectionStatus
-from ..config import settings
+from config import settings
 
 
 class ExchangeManager:
@@ -45,6 +45,10 @@ class ExchangeManager:
         await ExchangeFactory.close_all_adapters()
         self.adapters.clear()
         self.logger.info("Exchange manager shutdown complete")
+
+    def get_supported_exchanges(self):
+        """Return list of supported exchanges"""
+        return list(ExchangeFactory.get_supported_exchanges())
 
     async def get_adapter(self, exchange_id: str, credentials: Optional[Dict[str, str]] = None,
                           options: Optional[Dict[str, Any]] = None) -> Optional[ExchangeAdapter]:

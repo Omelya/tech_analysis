@@ -3,15 +3,16 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import structlog
-import aioredis
+import redis
 import aiomysql
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
-from .exchanges.manager import exchange_manager
-from .config import settings
-from .models.database import HistoricalData, TradingPair, Exchange
-from .utils.rabbitmq import RabbitMQPublisher
+from historical_data_service import TaskPriority, historical_data_service
+from exchanges.manager import exchange_manager
+from config import settings
+from models.database import HistoricalData, TradingPair, Exchange
+from utils.rabbitmq import RabbitMQPublisher
 
 
 class DataProcessor:
@@ -19,7 +20,7 @@ class DataProcessor:
 
     def __init__(self):
         self.logger = structlog.get_logger().bind(component="data_processor")
-        self.redis_client: Optional[aioredis.Redis] = None
+        self.redis_client: Optional[redis.Redis] = None
         self.db_engine = None
         self.session_factory = None
         self.rabbitmq_publisher: Optional[RabbitMQPublisher] = None
@@ -46,7 +47,7 @@ class DataProcessor:
             )
 
             # Initialize Redis
-            self.redis_client = aioredis.from_url(
+            self.redis_client = redis.from_url(
                 f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
             )
 
@@ -360,11 +361,6 @@ class DataProcessor:
                 self.logger.error("Failed to get active trading pairs", error=str(e))
                 return []
 
-    async def fill_historical_data_gaps(self, exchange_slug: str, symbol: str):
-        """Fill missing historical data"""
-        # Implementation for gap filling
-        pass
-
     async def stop_all_tasks(self):
         """Stop all processing tasks"""
         for task_name, task in self.active_tasks.items():
@@ -385,6 +381,112 @@ class DataProcessor:
             await self.redis_client.close()
 
         self.logger.info("All processing tasks stopped")
+
+    async def fill_historical_data_gaps(self, exchange_slug: str, symbol: str):
+        """Fill missing historical data gaps"""
+        try:
+            self.logger.info("Checking for historical data gaps",
+                             exchange=exchange_slug, symbol=symbol)
+
+            # Get trading pair ID
+            async with self.session_factory() as session:
+                query = """
+                SELECT tp.id FROM trading_pairs tp
+                JOIN exchanges e ON tp.exchange_id = e.id
+                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
+                """
+
+                result = await session.execute(query, {
+                    'exchange_slug': exchange_slug,
+                    'symbol': symbol
+                })
+
+                pair_row = result.fetchone()
+                if not pair_row:
+                    self.logger.warning("Trading pair not found",
+                                        exchange=exchange_slug, symbol=symbol)
+                    return
+
+                trading_pair_id = pair_row[0]
+
+            # Check gaps for each timeframe
+            for timeframe in settings.default_timeframes:
+                # Get last timestamp for this pair/timeframe
+                async with self.session_factory() as session:
+                    query = """
+                    SELECT 
+                        MIN(timestamp) as first_time,
+                        MAX(timestamp) as last_time,
+                        COUNT(*) as record_count
+                    FROM historical_data
+                    WHERE trading_pair_id = :pair_id AND timeframe = :timeframe
+                    """
+
+                    result = await session.execute(query, {
+                        'pair_id': trading_pair_id,
+                        'timeframe': timeframe
+                    })
+
+                    stats_row = result.fetchone()
+                    if not stats_row or stats_row[2] == 0:
+                        # No data for this timeframe yet, schedule initial fetch
+                        await historical_data_service.schedule_task(
+                            exchange_slug=exchange_slug,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            priority=TaskPriority.HIGH,
+                            limit=1000
+                        )
+                        continue
+
+                    first_time, last_time, record_count = stats_row
+
+                    # Get expected record count based on timeframe
+                    timeframe_seconds = self._get_timeframe_seconds(timeframe)
+                    expected_records = int((last_time - first_time).total_seconds() / timeframe_seconds) + 1
+
+                    if record_count < expected_records * 0.95:  # Allow 5% missing records
+                        self.logger.info("Detected data gaps",
+                                         exchange=exchange_slug, symbol=symbol,
+                                         timeframe=timeframe,
+                                         expected=expected_records,
+                                         actual=record_count)
+
+                        # Schedule gap detection and fill
+                        await historical_data_service.detect_and_fill_gaps(
+                            exchange_slug, symbol, timeframe
+                        )
+
+                    # Check if we need to update recent data
+                    time_since_last = (datetime.now() - last_time).total_seconds()
+                    if time_since_last > timeframe_seconds * 3:  # If last record is older than 3 intervals
+                        self.logger.info("Scheduling recent data update",
+                                         exchange=exchange_slug, symbol=symbol,
+                                         timeframe=timeframe)
+
+                        await historical_data_service.schedule_incremental_update(
+                            exchange_slug, symbol, timeframe
+                        )
+
+            self.logger.info("Historical data gap check completed",
+                             exchange=exchange_slug, symbol=symbol)
+
+        except Exception as e:
+            self.logger.error("Error checking for historical data gaps",
+                              exchange=exchange_slug, symbol=symbol, error=str(e))
+
+    def _get_timeframe_seconds(self, timeframe: str) -> int:
+        """Convert timeframe to seconds"""
+        timeframe_map = {
+            '1m': 60,
+            '5m': 300,
+            '15m': 900,
+            '30m': 1800,
+            '1h': 3600,
+            '4h': 14400,
+            '1d': 86400
+        }
+        return timeframe_map.get(timeframe, 60)
 
 
 # Global instance
