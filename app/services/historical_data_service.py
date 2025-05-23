@@ -8,10 +8,11 @@ import heapq
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
+from sqlalchemy import text, select
 
 from ..exchanges.manager import exchange_manager
 from ..config import settings
+from ..models.database import TradingPair, HistoricalData
 from ..utils.metrics_collector import metrics_collector
 from ..utils.db_error_handler import db_error_handler
 
@@ -142,11 +143,11 @@ class HistoricalDataService:
 
         return task_ids
 
-    async def schedule_incremental_update(self, exchange_slug: str, symbol: str, timeframe: str) -> Optional[str]:
+    def schedule_incremental_update(self, exchange_slug: str, symbol: str, timeframe: str) -> Optional[str]:
         """Schedule incremental update for recent data"""
         try:
             # Get last timestamp for this pair/timeframe
-            async with self.session_factory() as session:
+            with self.session_factory() as session:
                 query = """
                 SELECT MAX(hd.timestamp) as latest_time
                 FROM historical_data hd
@@ -155,7 +156,7 @@ class HistoricalDataService:
                 WHERE e.slug = :exchange_slug AND tp.symbol = :symbol AND hd.timeframe = :timeframe
                 """
 
-                result = await session.execute(text(query), {
+                result = session.execute(text(query), {
                     'exchange_slug': exchange_slug,
                     'symbol': symbol,
                     'timeframe': timeframe
@@ -214,28 +215,22 @@ class HistoricalDataService:
         """Detect gaps in historical data"""
         try:
             async with self.session_factory() as session:
-                query = """
-                SELECT hd.timestamp
-                FROM historical_data hd
-                JOIN trading_pairs tp ON hd.trading_pair_id = tp.id
-                JOIN exchanges e ON tp.exchange_id = e.id
-                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol AND hd.timeframe = :timeframe
-                AND hd.timestamp >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                ORDER BY hd.timestamp ASC
-                """
+                trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
+                if not trading_pair:
+                    return []
 
-                result = await session.execute(text(query), {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol,
-                    'timeframe': timeframe
-                })
+                query = select(HistoricalData.timestamp) \
+                    .where(HistoricalData.trading_pair_id == trading_pair.id,
+                           HistoricalData.timeframe == timeframe,
+                           HistoricalData.timestamp >= datetime.now() - timedelta(days=30)) \
+                    .order_by(HistoricalData.timestamp.asc())
 
+                result = await session.execute(query)
                 timestamps = [row[0] for row in result.fetchall()]
 
             if len(timestamps) < 2:
                 return []
 
-            # Detect gaps
             gaps = []
             timeframe_delta = timedelta(seconds=self._get_timeframe_seconds(timeframe))
 
@@ -243,7 +238,6 @@ class HistoricalDataService:
                 expected_time = timestamps[i - 1] + timeframe_delta
                 actual_time = timestamps[i]
 
-                # If gap is larger than 2 intervals, consider it a gap
                 if actual_time - expected_time > timeframe_delta * 2:
                     gaps.append((expected_time, actual_time))
 
@@ -362,68 +356,17 @@ class HistoricalDataService:
     async def _save_klines_operation(self, session: AsyncSession, exchange_slug: str, symbol: str,
                                      timeframe: str, klines: List[List]) -> int:
         """Database operation for saving klines"""
-        saved_count = 0
+        try:
+            trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
+            if not trading_pair:
+                return 0
 
-        # Get trading pair ID
-        pair_query = """
-        SELECT tp.id FROM trading_pairs tp
-        JOIN exchanges e ON tp.exchange_id = e.id
-        WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-        """
-        result = await session.execute(text(pair_query), {
-            'exchange_slug': exchange_slug,
-            'symbol': symbol
-        })
-        pair_row = result.fetchone()
+            return await HistoricalData.save_klines(session, trading_pair.id, timeframe, klines)
 
-        if not pair_row:
+        except Exception as e:
+            self.logger.error("Failed to save historical data",
+                              exchange=exchange_slug, symbol=symbol, error=str(e))
             return 0
-
-        trading_pair_id = pair_row[0]
-
-        # Batch insert for better performance
-        insert_values = []
-        for kline in klines:
-            timestamp = datetime.fromtimestamp(kline[0] / 1000)
-
-            # Check if already exists (only for critical data)
-            check_query = """
-            SELECT COUNT(*) FROM historical_data 
-            WHERE trading_pair_id = :pair_id 
-            AND timeframe = :timeframe 
-            AND timestamp = :timestamp
-            """
-            result = await session.execute(text(check_query), {
-                'pair_id': trading_pair_id,
-                'timeframe': timeframe,
-                'timestamp': timestamp
-            })
-
-            if result.scalar() == 0:
-                insert_values.append({
-                    'pair_id': trading_pair_id,
-                    'timeframe': timeframe,
-                    'timestamp': timestamp,
-                    'open': kline[1],
-                    'high': kline[2],
-                    'low': kline[3],
-                    'close': kline[4],
-                    'volume': kline[5]
-                })
-
-        # Batch insert
-        if insert_values:
-            insert_query = """
-            INSERT INTO historical_data 
-            (trading_pair_id, timeframe, timestamp, open, high, low, close, volume, created_at, updated_at)
-            VALUES (:pair_id, :timeframe, :timestamp, :open, :high, :low, :close, :volume, NOW(), NOW())
-            """
-
-            await session.execute(text(insert_query), insert_values)
-            saved_count = len(insert_values)
-
-        await session.commit()
-        return saved_count
 
     def _can_make_request(self, exchange_slug: str) -> bool:
         """Check if we can make a request to the exchange"""

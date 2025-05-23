@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from .historical_data_service import historical_data_service, TaskPriority
 from ..exchanges.manager import exchange_manager
 from ..config import settings
+from ..models.database import TradingPair, HistoricalData
 from ..utils.rabbitmq import RabbitMQPublisher
 
 
@@ -19,7 +20,7 @@ class DataProcessor:
 
     def __init__(self):
         self.logger = structlog.get_logger().bind(component="data_processor")
-        self.redis_client: Optional[redis.Redis] = None
+        self.redis_client: Optional[redis.asyncio.Redis] = None
         self.db_engine = None
         self.session_factory = None
         self.rabbitmq_publisher: Optional[RabbitMQPublisher] = None
@@ -50,8 +51,11 @@ class DataProcessor:
             )
 
             # Initialize Redis
-            self.redis_client = redis.from_url(
-                f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
+            import redis.asyncio as redis_async
+            self.redis_client = redis_async.from_url(
+                f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}",
+                password=settings.redis_password if settings.redis_password else None,
+                decode_responses=True,
             )
 
             # Initialize RabbitMQ publisher
@@ -87,9 +91,6 @@ class DataProcessor:
     async def start_automatic_processing(self):
         """Start optimized data processing tasks"""
         try:
-            # Instead of creating thousands of individual tasks,
-            # create one task per exchange per data type
-
             for exchange_slug, pairs in self.pairs_by_exchange.items():
                 # One ticker task per exchange (handles all pairs)
                 task_key = f"ticker_batch_{exchange_slug}"
@@ -235,37 +236,11 @@ class DataProcessor:
                 self.logger.error("Error in historical sync loop", error=str(e))
                 await asyncio.sleep(self.intervals['historical_sync'])
 
-    # Database methods remain the same...
     async def save_ticker_to_db(self, exchange_slug: str, symbol: str, ticker: Dict[str, Any]):
         """Save ticker data to database"""
         async with self.session_factory() as session:
             try:
-                query = text("""
-                UPDATE trading_pairs tp
-                JOIN exchanges e ON tp.exchange_id = e.id
-                SET tp.last_price = :last_price,
-                    tp.bid_price = :bid_price,
-                    tp.ask_price = :ask_price,
-                    tp.volume_24h = :volume_24h,
-                    tp.price_change_24h = :price_change,
-                    tp.price_change_percentage_24h = :price_change_percent,
-                    tp.updated_at = NOW()
-                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """)
-
-                await session.execute(query, {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol,
-                    'last_price': ticker.get('last', 0),
-                    'bid_price': ticker.get('bid', 0),
-                    'ask_price': ticker.get('ask', 0),
-                    'volume_24h': ticker.get('baseVolume', 0),
-                    'price_change': ticker.get('change', 0),
-                    'price_change_percent': ticker.get('percentage', 0)
-                })
-
-                await session.commit()
-
+                await TradingPair.update_ticker_data(session, exchange_slug, symbol, ticker)
             except Exception as e:
                 await session.rollback()
                 self.logger.error("Failed to save ticker to DB",
@@ -276,64 +251,11 @@ class DataProcessor:
         """Save klines data to database"""
         async with self.session_factory() as session:
             try:
-                saved_count = 0
-
-                # Get trading pair ID
-                pair_query = text("""
-                SELECT tp.id FROM trading_pairs tp
-                JOIN exchanges e ON tp.exchange_id = e.id
-                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """)
-                result = await session.execute(pair_query, {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol
-                })
-                pair_row = result.fetchone()
-
-                if not pair_row:
+                trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
+                if not trading_pair:
                     return 0
 
-                trading_pair_id = pair_row[0]
-
-                # Batch insert preparation
-                insert_values = []
-
-                for kline in klines:
-                    timestamp = datetime.fromtimestamp(kline[0] / 1000)
-
-                    # For batch processing, we skip existence check to improve performance
-                    # This might create some duplicates, but we handle it with ON DUPLICATE KEY UPDATE
-                    insert_values.append({
-                        'pair_id': trading_pair_id,
-                        'timeframe': timeframe,
-                        'timestamp': timestamp,
-                        'open': kline[1],
-                        'high': kline[2],
-                        'low': kline[3],
-                        'close': kline[4],
-                        'volume': kline[5]
-                    })
-
-                # Optimized batch insert with ON DUPLICATE KEY UPDATE
-                if insert_values:
-                    insert_query = text("""
-                    INSERT INTO historical_data 
-                    (trading_pair_id, timeframe, timestamp, open, high, low, close, volume, created_at, updated_at)
-                    VALUES (:pair_id, :timeframe, :timestamp, :open, :high, :low, :close, :volume, NOW(), NOW())
-                    ON DUPLICATE KEY UPDATE
-                    open = VALUES(open),
-                    high = VALUES(high),
-                    low = VALUES(low),
-                    close = VALUES(close),
-                    volume = VALUES(volume),
-                    updated_at = NOW()
-                    """)
-
-                    await session.execute(insert_query, insert_values)
-                    saved_count = len(insert_values)
-
-                await session.commit()
-                return saved_count
+                return await HistoricalData.save_klines(session, trading_pair.id, timeframe, klines)
 
             except Exception as e:
                 await session.rollback()
@@ -353,11 +275,11 @@ class DataProcessor:
                 'symbol': symbol
             }
 
-            await self.redis_client.setex(
-                cache_key,
-                settings.cache_ttl_ticker,
-                json.dumps(cache_data)
-            )
+            await self.redis_client.set(
+                    cache_key,
+                    json.dumps(cache_data),
+                    ex=settings.cache_ttl_ticker
+                )
 
         except Exception as e:
             self.logger.error("Failed to cache ticker data",
@@ -412,18 +334,7 @@ class DataProcessor:
         """Get list of active trading pairs from database"""
         async with self.session_factory() as session:
             try:
-                query = text("""
-                SELECT tp.symbol, e.slug as exchange_slug, tp.id as trading_pair_id
-                FROM trading_pairs tp
-                JOIN exchanges e ON tp.exchange_id = e.id
-                WHERE tp.is_active = 1 AND e.is_active = 1
-                ORDER BY e.slug, tp.symbol
-                """)
-
-                result = await session.execute(query)
-                return [{'symbol': row[0], 'exchange_slug': row[1], 'trading_pair_id': row[2]}
-                        for row in result.fetchall()]
-
+                return await TradingPair.get_active_pairs(session)
             except Exception as e:
                 self.logger.error("Failed to get active trading pairs", error=str(e))
                 return []
@@ -514,14 +425,15 @@ class DataProcessor:
 
                     stats_row = result.fetchone()
                     if not stats_row or stats_row[1] == 0:
-                        # Schedule initial fetch for new pairs
-                        await historical_data_service.schedule_task(
+                        task_id = historical_data_service.schedule_task(
                             exchange_slug=exchange_slug,
                             symbol=symbol,
                             timeframe=timeframe,
                             priority=TaskPriority.MEDIUM,  # Reduced priority
                             limit=168  # 1 week of hourly data
                         )
+                        self.logger.info(
+                            f"Scheduled initial fetch for {exchange_slug}:{symbol}:{timeframe}, task_id: {task_id}")
                         continue
 
                     last_time, record_count = stats_row
@@ -532,9 +444,14 @@ class DataProcessor:
                         timeframe_seconds = self._get_timeframe_seconds(timeframe)
 
                         if time_since_last > timeframe_seconds * 2:
-                            await historical_data_service.schedule_incremental_update(
-                                exchange_slug, symbol, timeframe
-                            )
+                            if asyncio.iscoroutinefunction(historical_data_service.schedule_incremental_update):
+                                await historical_data_service.schedule_incremental_update(
+                                    exchange_slug, symbol, timeframe
+                                )
+                            else:
+                                historical_data_service.schedule_incremental_update(
+                                    exchange_slug, symbol, timeframe
+                                )
 
         except Exception as e:
             self.logger.error("Error checking for historical data gaps",

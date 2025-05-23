@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from ..exchanges.manager import exchange_manager
 from ..config import settings
+from ..models.database import TradingPair
 from ..utils.rabbitmq import RabbitMQPublisher
 
 
@@ -20,7 +21,7 @@ class OrderbookProcessor:
 
     def __init__(self):
         self.logger = structlog.get_logger().bind(component="orderbook_processor")
-        self.redis_client: Optional[redis.Redis] = None
+        self.redis_client: Optional[redis.asyncio.Redis] = None
         self.db_engine = None
         self.session_factory = None
         self.rabbitmq_publisher: Optional[RabbitMQPublisher] = None
@@ -49,8 +50,10 @@ class OrderbookProcessor:
             )
 
             # Initialize Redis
-            self.redis_client = redis.from_url(
-                f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
+            self.redis_client = redis.asyncio.from_url(
+                f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}",
+                password=settings.redis_password if settings.redis_password else None,
+                decode_responses=True,
             )
 
             # Initialize RabbitMQ publisher
@@ -169,10 +172,10 @@ class OrderbookProcessor:
             cached_data['bids'] = orderbook.get('bids', [])[:50]
             cached_data['asks'] = orderbook.get('asks', [])[:50]
 
-            await self.redis_client.setex(
+            await self.redis_client.set(
                 cache_key,
-                settings.cache_ttl_orderbook,
-                json.dumps(cached_data)
+                json.dumps(cached_data),
+                ex=settings.cache_ttl_ticker
             )
 
         except Exception as e:
@@ -189,28 +192,14 @@ class OrderbookProcessor:
                 if not bids or not asks:
                     return
 
-                # Calculate basic metrics
-                best_bid = float(bids[0][0]) if bids else 0
-                best_ask = float(asks[0][0]) if asks else 0
+                trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
 
-                # Update trading pair with current orderbook metrics
-                query = """
-                UPDATE trading_pairs tp
-                JOIN exchanges e ON tp.exchange_id = e.id
-                SET tp.bid_price = :best_bid,
-                    tp.ask_price = :best_ask,
-                    tp.updated_at = NOW()
-                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """
+                if trading_pair:
+                    trading_pair.bid_price = float(bids[0][0]) if bids else 0
+                    trading_pair.ask_price = float(asks[0][0]) if asks else 0
+                    trading_pair.updated_at = datetime.now()
 
-                await session.execute(text(query), {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol,
-                    'best_bid': best_bid,
-                    'best_ask': best_ask
-                })
-
-                await session.commit()
+                    await session.commit()
 
             except Exception as e:
                 await session.rollback()
@@ -234,10 +223,10 @@ class OrderbookProcessor:
             }
 
             # Store snapshot with longer TTL (1 hour)
-            await self.redis_client.setex(
+            await self.redis_client.set(
                 snapshot_key,
+                json.dumps(snapshot_data),
                 3600,
-                json.dumps(snapshot_data)
             )
 
         except Exception as e:
