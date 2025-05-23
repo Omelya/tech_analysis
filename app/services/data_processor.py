@@ -5,14 +5,15 @@ from typing import Dict, List, Optional, Any
 import structlog
 import redis
 import aiomysql
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
-from historical_data_service import TaskPriority, historical_data_service
-from exchanges.manager import exchange_manager
-from config import settings
-from models.database import HistoricalData, TradingPair, Exchange
-from utils.rabbitmq import RabbitMQPublisher
+from .historical_data_service import historical_data_service, TaskPriority
+from ..exchanges.manager import exchange_manager
+from ..config import settings
+from ..models.database import HistoricalData, TradingPair, Exchange
+from ..utils.rabbitmq import RabbitMQPublisher
 
 
 class DataProcessor:
@@ -174,7 +175,7 @@ class DataProcessor:
         async with self.session_factory() as session:
             try:
                 # Update trading pair with latest ticker info
-                query = """
+                query = text("""
                 UPDATE trading_pairs tp
                 JOIN exchanges e ON tp.exchange_id = e.id
                 SET tp.last_price = :last_price,
@@ -185,7 +186,7 @@ class DataProcessor:
                     tp.price_change_percentage_24h = :price_change_percent,
                     tp.updated_at = NOW()
                 WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """
+                """)
 
                 await session.execute(query, {
                     'exchange_slug': exchange_slug,
@@ -213,11 +214,11 @@ class DataProcessor:
                 saved_count = 0
 
                 # Get trading pair ID
-                pair_query = """
+                pair_query = text("""
                 SELECT tp.id FROM trading_pairs tp
                 JOIN exchanges e ON tp.exchange_id = e.id
                 WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """
+                """)
                 result = await session.execute(pair_query, {
                     'exchange_slug': exchange_slug,
                     'symbol': symbol
@@ -234,12 +235,12 @@ class DataProcessor:
                     timestamp = datetime.fromtimestamp(kline[0] / 1000)
 
                     # Check if already exists
-                    check_query = """
+                    check_query = text("""
                     SELECT COUNT(*) FROM historical_data 
                     WHERE trading_pair_id = :pair_id 
                     AND timeframe = :timeframe 
                     AND timestamp = :timestamp
-                    """
+                    """)
                     result = await session.execute(check_query, {
                         'pair_id': trading_pair_id,
                         'timeframe': timeframe,
@@ -248,11 +249,11 @@ class DataProcessor:
 
                     if result.scalar() == 0:
                         # Insert new record
-                        insert_query = """
+                        insert_query = text("""
                         INSERT INTO historical_data 
                         (trading_pair_id, timeframe, timestamp, open, high, low, close, volume, created_at, updated_at)
                         VALUES (:pair_id, :timeframe, :timestamp, :open, :high, :low, :close, :volume, NOW(), NOW())
-                        """
+                        """)
 
                         await session.execute(insert_query, {
                             'pair_id': trading_pair_id,
@@ -346,12 +347,12 @@ class DataProcessor:
         """Get list of active trading pairs from database"""
         async with self.session_factory() as session:
             try:
-                query = """
+                query = text("""
                 SELECT tp.symbol, e.slug as exchange_slug, tp.id as trading_pair_id
                 FROM trading_pairs tp
                 JOIN exchanges e ON tp.exchange_id = e.id
                 WHERE tp.is_active = 1 AND e.is_active = 1
-                """
+                """)
 
                 result = await session.execute(query)
                 return [{'symbol': row[0], 'exchange_slug': row[1], 'trading_pair_id': row[2]}
@@ -390,11 +391,11 @@ class DataProcessor:
 
             # Get trading pair ID
             async with self.session_factory() as session:
-                query = """
+                query = text("""
                 SELECT tp.id FROM trading_pairs tp
                 JOIN exchanges e ON tp.exchange_id = e.id
                 WHERE e.slug = :exchange_slug AND tp.symbol = :symbol
-                """
+                """)
 
                 result = await session.execute(query, {
                     'exchange_slug': exchange_slug,
@@ -413,14 +414,14 @@ class DataProcessor:
             for timeframe in settings.default_timeframes:
                 # Get last timestamp for this pair/timeframe
                 async with self.session_factory() as session:
-                    query = """
+                    query = text("""
                     SELECT 
                         MIN(timestamp) as first_time,
                         MAX(timestamp) as last_time,
                         COUNT(*) as record_count
                     FROM historical_data
                     WHERE trading_pair_id = :pair_id AND timeframe = :timeframe
-                    """
+                    """)
 
                     result = await session.execute(query, {
                         'pair_id': trading_pair_id,

@@ -42,7 +42,7 @@ class TradingPair(Base):
     maker_fee = Column(Numeric(10, 6), nullable=True)
     taker_fee = Column(Numeric(10, 6), nullable=True)
     is_active = Column(Boolean, default=True)
-    metadata = Column(JSON, nullable=True)
+    pair_metadata = Column(JSON, nullable=True)
     last_price = Column(Numeric(24, 12), nullable=True)
     bid_price = Column(Numeric(24, 12), nullable=True)
     ask_price = Column(Numeric(24, 12), nullable=True)

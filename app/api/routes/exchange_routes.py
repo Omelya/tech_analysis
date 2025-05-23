@@ -3,8 +3,8 @@ from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel
 import structlog
 
-from exchanges.manager import exchange_manager
-from exchanges.factory import ExchangeFactory
+from ...exchanges.manager import exchange_manager
+from ...exchanges.factory import ExchangeFactory
 
 
 class ExchangeCredentials(BaseModel):

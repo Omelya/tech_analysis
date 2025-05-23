@@ -4,7 +4,7 @@ from typing import Any
 import structlog
 from structlog.types import Processor
 
-from config import settings
+from ..config import settings
 
 
 def setup_logging():

@@ -4,10 +4,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import structlog
 
-from config import settings
-from exchanges.manager import exchange_manager
-from api.routes import exchange_routes
-from utils.logging import setup_logging
+from .config import settings
+from .exchanges.manager import exchange_manager
+from .api.routes import exchange_routes
+from .utils.logging import setup_logging
 
 
 def create_app() -> FastAPI:
@@ -42,7 +42,7 @@ def create_app() -> FastAPI:
         await exchange_manager.initialize()
 
         # Initialize data processor
-        from services.data_processor import data_processor
+        from .services.data_processor import data_processor
         await data_processor.initialize()
 
         # Start automatic data processing

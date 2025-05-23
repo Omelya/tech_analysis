@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # Database settings
-    database_url: str = "mysql+aiomysql://user:password@localhost:3306/crypto_db"
+    database_url: str = "mysql+aiomysql://crypto_user:crypto_password@localhost:3306/crypto_db"
 
     # Redis settings
     redis_host: str = "localhost"

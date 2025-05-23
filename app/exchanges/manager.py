@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from .factory import ExchangeFactory
 from .base import ExchangeAdapter, ConnectionStatus
-from config import settings
+from ..config import settings
 
 
 class ExchangeManager:

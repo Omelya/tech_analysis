@@ -1,8 +1,8 @@
 import asyncio
 import json
 from typing import Dict, Any, Optional
-import aio_pika
-from aio_pika import connect_robust, Message, DeliveryMode
+from aio_pika import connect_robust, Message, DeliveryMode, RobustConnection, RobustChannel, ExchangeType, \
+    IncomingMessage
 import structlog
 
 
@@ -11,8 +11,8 @@ class RabbitMQPublisher:
 
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
-        self.connection: Optional[aio_pika.RobustConnection] = None
-        self.channel: Optional[aio_pika.RobustChannel] = None
+        self.connection: Optional[RobustConnection] = None
+        self.channel: Optional[RobustChannel] = None
         self.logger = structlog.get_logger().bind(component="rabbitmq_publisher")
 
     async def initialize(self):
@@ -36,7 +36,7 @@ class RabbitMQPublisher:
         # Main events exchange
         crypto_exchange = await self.channel.declare_exchange(
             'crypto_events',
-            type=aio_pika.ExchangeType.TOPIC,
+            type=ExchangeType.TOPIC,
             durable=True
         )
 
@@ -115,8 +115,8 @@ class RabbitMQConsumer:
 
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
-        self.connection: Optional[aio_pika.RobustConnection] = None
-        self.channel: Optional[aio_pika.RobustChannel] = None
+        self.connection: Optional[RobustConnection] = None
+        self.channel: Optional[RobustChannel] = None
         self.logger = structlog.get_logger().bind(component="rabbitmq_consumer")
 
     async def initialize(self):
@@ -147,7 +147,7 @@ class RabbitMQConsumer:
 
         self.logger.info("Command queue setup completed")
 
-    async def process_command(self, message: aio_pika.IncomingMessage):
+    async def process_command(self, message: IncomingMessage):
         """Process command from Laravel"""
         try:
             # Parse message
