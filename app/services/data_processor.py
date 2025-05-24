@@ -425,7 +425,7 @@ class DataProcessor:
 
                     stats_row = result.fetchone()
                     if not stats_row or stats_row[1] == 0:
-                        task_id = historical_data_service.schedule_task(
+                        task_id = historical_data_service.schedule_optimized_task(
                             exchange_slug=exchange_slug,
                             symbol=symbol,
                             timeframe=timeframe,

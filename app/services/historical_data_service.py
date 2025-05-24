@@ -4,495 +4,444 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
-import heapq
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text, select
 
+from app.utils.rate_limiter import rate_limiter, RequestType
+from .request_scheduler import request_scheduler
 from ..exchanges.manager import exchange_manager
-from ..config import settings
 from ..models.database import TradingPair, HistoricalData
 from ..utils.metrics_collector import metrics_collector
-from ..utils.db_error_handler import db_error_handler
 
 
 class TaskPriority(Enum):
-    """Task priority levels"""
-    LOW = 3
-    MEDIUM = 2
-    HIGH = 1
-    CRITICAL = 0
+    """Optimized task priority levels"""
+    CRITICAL = 0  # Real-time gaps, immediate needs
+    HIGH = 1  # Recent data gaps (< 24h)
+    MEDIUM = 2  # Regular updates (< 7 days)
+    LOW = 3  # Bulk historical (> 7 days)
+    BACKGROUND = 4  # Archive/cleanup tasks
 
 
 @dataclass
-class HistoricalDataTask:
-    """Historical data fetch task"""
-    priority: TaskPriority
+class HistoricalTask:
+    """Optimized historical data task with smart scheduling"""
     exchange_slug: str
     symbol: str
     timeframe: str
-    since: Optional[int]
-    limit: int
-    created_at: float
-    retries: int = 0
-    max_retries: int = 3
+    priority: TaskPriority
+    since: Optional[int] = None
+    limit: int = 1000
+    chunk_size: int = 500
+    created_at: float = None
+    estimated_requests: int = 1
 
-    def __lt__(self, other):
-        """Compare tasks for priority queue"""
-        if self.priority.value != other.priority.value:
-            return self.priority.value < other.priority.value
-        return self.created_at < other.created_at
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = time.time()
 
 
-class HistoricalDataService:
-    """Service for fetching and managing historical data"""
+class OptimizedHistoricalDataService:
+    """Optimized historical data service with intelligent request management"""
 
     def __init__(self):
-        self.logger = structlog.get_logger().bind(component="historical_data_service")
-        self.task_queue: List[HistoricalDataTask] = []
-        self.active_tasks: Dict[str, asyncio.Task] = {}
-        self.running = False
+        self.logger = structlog.get_logger().bind(component="optimized_historical_service")
 
-        # Rate limiting per exchange
-        self.rate_limits = {
-            'binance': {'requests_per_minute': 1200, 'current': 0, 'reset_time': 0},
-            'bybit': {'requests_per_minute': 600, 'current': 0, 'reset_time': 0},
-            'whitebit': {'requests_per_minute': 300, 'current': 0, 'reset_time': 0}
+        # Task management
+        self.pending_tasks: Dict[str, HistoricalTask] = {}
+        self.active_tasks: Dict[str, asyncio.Task] = {}
+
+        # Optimization strategies
+        self.batch_strategies = {
+            'binance': {'max_batch_size': 1000, 'preferred_chunk': 500},
+            'bybit': {'max_batch_size': 500, 'preferred_chunk': 200},
+            'whitebit': {'max_batch_size': 200, 'preferred_chunk': 100}
         }
 
-        # Session factory
-        self.session_factory = None
+        # Smart scheduling
+        self.running = False
+        self.scheduler_task: Optional[asyncio.Task] = None
 
-        # Task processing settings
-        self.max_concurrent_tasks = 5
-        self.batch_size = 1000
+        # Performance tracking
+        self.completion_stats: Dict[str, List[float]] = {}
+        self.error_rates: Dict[str, float] = {}
 
     async def initialize(self, session_factory):
-        """Initialize the service"""
+        """Initialize optimized service"""
         self.session_factory = session_factory
         self.running = True
 
-        # Start task processor
-        self.active_tasks['processor'] = asyncio.create_task(self._process_tasks())
-        self.active_tasks['rate_limiter'] = asyncio.create_task(self._rate_limit_reset_loop())
+        # Initialize smart scheduler
+        await request_scheduler.initialize()
 
-        self.logger.info("Historical data service initialized")
+        # Start task scheduler
+        self.scheduler_task = asyncio.create_task(self._optimized_scheduler_loop())
 
-    async def shutdown(self):
-        """Shutdown the service"""
-        self.running = False
+        self.logger.info("Optimized historical data service initialized")
 
-        # Cancel all tasks
-        for task in self.active_tasks.values():
-            task.cancel()
+    async def schedule_optimized_task(self, exchange_slug: str, symbol: str, timeframe: str,
+                                      priority: TaskPriority = TaskPriority.MEDIUM,
+                                      since: Optional[int] = None, limit: int = 1000) -> str:
+        """Schedule optimized historical data task"""
 
-        # Wait for tasks to complete
-        await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
-        self.active_tasks.clear()
-
-        self.logger.info("Historical data service shutdown")
-
-    def schedule_task(self, exchange_slug: str, symbol: str, timeframe: str,
-                      priority: TaskPriority = TaskPriority.MEDIUM,
-                      since: Optional[int] = None, limit: int = 1000) -> str:
-        """Schedule a historical data fetch task"""
-        task = HistoricalDataTask(
-            priority=priority,
+        # Create optimized task
+        task = HistoricalTask(
             exchange_slug=exchange_slug,
             symbol=symbol,
             timeframe=timeframe,
+            priority=priority,
             since=since,
-            limit=limit,
-            created_at=time.time()
+            limit=limit
         )
 
-        heapq.heappush(self.task_queue, task)
+        # Optimize task parameters
+        await self._optimize_task_parameters(task)
 
-        task_id = f"{exchange_slug}_{symbol}_{timeframe}_{task.created_at}"
-        self.logger.info("Task scheduled", task_id=task_id, priority=priority.name)
+        # Generate task ID
+        task_id = f"{exchange_slug}_{symbol}_{timeframe}_{int(task.created_at)}"
+        self.pending_tasks[task_id] = task
 
-        metrics_collector.increment_counter('historical_tasks_scheduled',
-                                            {'exchange': exchange_slug, 'priority': priority.name})
+        self.logger.info("Optimized task scheduled",
+                         task_id=task_id, priority=priority.name,
+                         estimated_requests=task.estimated_requests)
 
         return task_id
 
-    def schedule_bulk_import(self, exchange_slug: str, symbol: str,
-                             timeframes: List[str], days_back: int = 30,
-                             priority: TaskPriority = TaskPriority.HIGH) -> List[str]:
-        """Schedule bulk historical data import"""
-        task_ids = []
-        base_time = datetime.now()
+    async def _optimize_task_parameters(self, task: HistoricalTask):
+        """Optimize task parameters based on exchange capacity and data requirements"""
 
-        for timeframe in timeframes:
-            # Calculate since timestamp based on timeframe and days_back
-            since = int((base_time - timedelta(days=days_back)).timestamp() * 1000)
+        # Get current exchange capacity
+        capacity = rate_limiter.get_exchange_capacity(task.exchange_slug)
 
-            task_id = self.schedule_task(
-                exchange_slug=exchange_slug,
-                symbol=symbol,
-                timeframe=timeframe,
-                priority=priority,
-                since=since,
-                limit=self.batch_size
-            )
-            task_ids.append(task_id)
+        # Get exchange-specific strategy
+        strategy = self.batch_strategies.get(task.exchange_slug, {
+            'max_batch_size': 500, 'preferred_chunk': 200
+        })
 
-        self.logger.info("Bulk import scheduled", exchange=exchange_slug,
-                         symbol=symbol, timeframes=timeframes, tasks=len(task_ids))
+        # Calculate optimal chunk size
+        remaining_capacity = capacity.get('requests_remaining', 100)
 
-        return task_ids
+        if remaining_capacity > 500:
+            task.chunk_size = strategy['max_batch_size']
+        elif remaining_capacity > 100:
+            task.chunk_size = strategy['preferred_chunk']
+        else:
+            task.chunk_size = min(strategy['preferred_chunk'] // 2, 100)
 
-    def schedule_incremental_update(self, exchange_slug: str, symbol: str, timeframe: str) -> Optional[str]:
-        """Schedule incremental update for recent data"""
-        try:
-            # Get last timestamp for this pair/timeframe
-            with self.session_factory() as session:
-                query = """
-                SELECT MAX(hd.timestamp) as latest_time
-                FROM historical_data hd
-                JOIN trading_pairs tp ON hd.trading_pair_id = tp.id
-                JOIN exchanges e ON tp.exchange_id = e.id
-                WHERE e.slug = :exchange_slug AND tp.symbol = :symbol AND hd.timeframe = :timeframe
-                """
+        # Estimate number of requests needed
+        if task.since:
+            timeframe_minutes = self._get_timeframe_minutes(task.timeframe)
+            time_range = (int(time.time() * 1000) - task.since) // (1000 * 60)
+            candles_needed = time_range // timeframe_minutes
+            task.estimated_requests = max(1, (candles_needed + task.chunk_size - 1) // task.chunk_size)
+        else:
+            task.estimated_requests = max(1, (task.limit + task.chunk_size - 1) // task.chunk_size)
 
-                result = session.execute(text(query), {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol,
-                    'timeframe': timeframe
-                })
-
-                latest_row = result.fetchone()
-                latest_time = latest_row[0] if latest_row and latest_row[0] else None
-
-            # Schedule update from last known time
-            since = int(latest_time.timestamp() * 1000) if latest_time else None
-
-            return self.schedule_task(
-                exchange_slug=exchange_slug,
-                symbol=symbol,
-                timeframe=timeframe,
-                priority=TaskPriority.HIGH,
-                since=since,
-                limit=500
-            )
-
-        except Exception as e:
-            self.logger.error("Error scheduling incremental update",
-                              exchange=exchange_slug, symbol=symbol, timeframe=timeframe, error=str(e))
-            return None
-
-    async def detect_and_fill_gaps(self, exchange_slug: str, symbol: str, timeframe: str) -> List[str]:
-        """Detect data gaps and schedule fill tasks"""
-        try:
-            gaps = await self._detect_data_gaps(exchange_slug, symbol, timeframe)
-            task_ids = []
-
-            for gap_start, gap_end in gaps:
-                task_id = self.schedule_task(
-                    exchange_slug=exchange_slug,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    priority=TaskPriority.MEDIUM,
-                    since=int(gap_start.timestamp() * 1000),
-                    limit=min(1000, int((gap_end - gap_start).total_seconds() / self._get_timeframe_seconds(timeframe)))
-                )
-                task_ids.append(task_id)
-
-            if gaps:
-                self.logger.info("Data gaps detected and scheduled",
-                                 exchange=exchange_slug, symbol=symbol, timeframe=timeframe, gaps=len(gaps))
-
-            return task_ids
-
-        except Exception as e:
-            self.logger.error("Error detecting gaps",
-                              exchange=exchange_slug, symbol=symbol, timeframe=timeframe, error=str(e))
-            return []
-
-    async def _detect_data_gaps(self, exchange_slug: str, symbol: str, timeframe: str) -> List[
-        Tuple[datetime, datetime]]:
-        """Detect gaps in historical data"""
-        try:
-            async with self.session_factory() as session:
-                trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
-                if not trading_pair:
-                    return []
-
-                query = select(HistoricalData.timestamp) \
-                    .where(HistoricalData.trading_pair_id == trading_pair.id,
-                           HistoricalData.timeframe == timeframe,
-                           HistoricalData.timestamp >= datetime.now() - timedelta(days=30)) \
-                    .order_by(HistoricalData.timestamp.asc())
-
-                result = await session.execute(query)
-                timestamps = [row[0] for row in result.fetchall()]
-
-            if len(timestamps) < 2:
-                return []
-
-            gaps = []
-            timeframe_delta = timedelta(seconds=self._get_timeframe_seconds(timeframe))
-
-            for i in range(1, len(timestamps)):
-                expected_time = timestamps[i - 1] + timeframe_delta
-                actual_time = timestamps[i]
-
-                if actual_time - expected_time > timeframe_delta * 2:
-                    gaps.append((expected_time, actual_time))
-
-            return gaps
-
-        except Exception as e:
-            self.logger.error("Error detecting data gaps", error=str(e))
-            return []
-
-    def _get_timeframe_seconds(self, timeframe: str) -> int:
-        """Convert timeframe to seconds"""
-        timeframe_map = {
-            '1m': 60,
-            '5m': 300,
-            '15m': 900,
-            '30m': 1800,
-            '1h': 3600,
-            '4h': 14400,
-            '1d': 86400
-        }
-        return timeframe_map.get(timeframe, 60)
-
-    async def _process_tasks(self):
-        """Main task processing loop"""
-        active_workers = []
-
+    async def _optimized_scheduler_loop(self):
+        """Optimized scheduler loop with intelligent task distribution"""
         while self.running:
             try:
-                # Clean up completed workers
-                active_workers = [w for w in active_workers if not w.done()]
+                if not self.pending_tasks:
+                    await asyncio.sleep(5)
+                    continue
 
-                # Process tasks if we have capacity and tasks available
-                while len(active_workers) < self.max_concurrent_tasks and self.task_queue:
-                    if not self._can_make_request(self.task_queue[0].exchange_slug):
-                        break
+                # Group tasks by exchange for batch optimization
+                exchange_tasks = self._group_tasks_by_exchange()
 
-                    task = heapq.heappop(self.task_queue)
-                    worker = asyncio.create_task(self._execute_task(task))
-                    active_workers.append(worker)
+                # Process each exchange's tasks optimally
+                for exchange, tasks in exchange_tasks.items():
+                    await self._process_exchange_tasks_optimally(exchange, tasks)
 
                 await asyncio.sleep(1)
 
             except Exception as e:
-                self.logger.error("Error in task processing loop", error=str(e))
-                await asyncio.sleep(5)
+                self.logger.error("Error in optimized scheduler loop", error=str(e))
+                await asyncio.sleep(10)
 
-    async def _execute_task(self, task: HistoricalDataTask):
-        """Execute a historical data fetch task"""
-        start_time = time.time()
+    def _group_tasks_by_exchange(self) -> Dict[str, List[Tuple[str, HistoricalTask]]]:
+        """Group pending tasks by exchange for batch optimization"""
+        exchange_tasks = {}
 
+        for task_id, task in self.pending_tasks.items():
+            exchange = task.exchange_slug
+            if exchange not in exchange_tasks:
+                exchange_tasks[exchange] = []
+            exchange_tasks[exchange].append((task_id, task))
+
+        return exchange_tasks
+
+    async def _process_exchange_tasks_optimally(self, exchange: str,
+                                                tasks: List[Tuple[str, HistoricalTask]]):
+        """Process exchange tasks with optimal resource allocation"""
+
+        capacity = rate_limiter.get_exchange_capacity(exchange)
+        remaining_requests = capacity.get('requests_remaining', 0)
+
+        if remaining_requests < 10:
+            return  # Wait for capacity
+
+        # Sort tasks by priority and estimated completion time
+        sorted_tasks = sorted(tasks, key=lambda x: (
+            x[1].priority.value,
+            x[1].estimated_requests,
+            x[1].created_at
+        ))
+
+        # Process tasks within capacity limits
+        processed_count = 0
+        request_budget = min(remaining_requests // 2, 50)  # Conservative approach
+
+        for task_id, task in sorted_tasks:
+            if processed_count >= request_budget:
+                break
+
+            if task.estimated_requests <= (request_budget - processed_count):
+                # Start task execution
+                await self._execute_optimized_task(task_id, task)
+                processed_count += task.estimated_requests
+
+                # Remove from pending
+                del self.pending_tasks[task_id]
+
+    async def _execute_optimized_task(self, task_id: str, task: HistoricalTask):
+        """Execute optimized historical data task"""
+
+        self.logger.info("Executing optimized task", task_id=task_id,
+                         exchange=task.exchange_slug, symbol=task.symbol,
+                         timeframe=task.timeframe)
+
+        # Create execution task
+        execution_task = asyncio.create_task(
+            self._smart_historical_fetch(task_id, task)
+        )
+
+        self.active_tasks[task_id] = execution_task
+
+    async def _smart_historical_fetch(self, task_id: str, task: HistoricalTask):
+        """Smart historical data fetching with chunked requests"""
         try:
-            self.logger.info("Executing task",
-                             exchange=task.exchange_slug, symbol=task.symbol,
-                             timeframe=task.timeframe, priority=task.priority.name)
+            start_time = time.time()
+            total_saved = 0
 
-            # Get adapter
-            adapter = await exchange_manager.get_public_adapter(task.exchange_slug)
-            if not adapter:
-                raise Exception(f"Could not get adapter for {task.exchange_slug}")
+            # Calculate chunks needed
+            chunks = self._calculate_optimal_chunks(task)
 
-            # Fetch data
-            klines = await adapter.rest.fetch_ohlcv(
-                task.symbol, task.timeframe, task.since, task.limit
-            )
+            self.logger.info("Starting smart fetch", task_id=task_id,
+                             chunks=len(chunks), chunk_size=task.chunk_size)
 
-            if not klines:
-                self.logger.warning("No data received",
-                                    exchange=task.exchange_slug, symbol=task.symbol, timeframe=task.timeframe)
-                return
+            # Process chunks with smart scheduling
+            for i, (chunk_since, chunk_limit) in enumerate(chunks):
 
-            # Save data
-            saved_count = await self._save_historical_data(task, klines)
+                # Define the request function
+                async def fetch_chunk():
+                    adapter = await exchange_manager.get_public_adapter(task.exchange_slug)
+                    if not adapter:
+                        raise Exception(f"No adapter for {task.exchange_slug}")
 
-            # Update rate limit
-            self._increment_rate_limit(task.exchange_slug)
+                    return await adapter.rest.fetch_ohlcv(
+                        task.symbol, task.timeframe, chunk_since, chunk_limit
+                    )
 
-            # Record metrics
-            execution_time = time.time() - start_time
-            metrics_collector.record_histogram('historical_task_duration', execution_time,
-                                               {'exchange': task.exchange_slug, 'timeframe': task.timeframe})
-            metrics_collector.record_data_processing('historical', task.exchange_slug, task.symbol,
-                                                     saved_count, execution_time)
+                # Define success callback
+                async def chunk_callback(result, error):
+                    nonlocal total_saved
+                    if error:
+                        self.logger.error("Chunk fetch failed",
+                                          task_id=task_id, chunk=i, error=str(error))
+                    elif result:
+                        saved = await self._save_chunk_data(task, result)
+                        total_saved += saved
+                        self.logger.debug("Chunk processed",
+                                          task_id=task_id, chunk=i, saved=saved)
 
-            self.logger.info("Task completed",
-                             exchange=task.exchange_slug, symbol=task.symbol,
-                             timeframe=task.timeframe, saved=saved_count, duration=execution_time)
-
-        except Exception as e:
-            self.logger.error("Task execution failed",
-                              exchange=task.exchange_slug, symbol=task.symbol,
-                              timeframe=task.timeframe, error=str(e), retries=task.retries)
-
-            # Retry logic
-            if task.retries < task.max_retries:
-                task.retries += 1
-                task.created_at = time.time() + (task.retries * 30)  # Exponential backoff
-                heapq.heappush(self.task_queue, task)
-                self.logger.info("Task rescheduled for retry", retries=task.retries)
-            else:
-                metrics_collector.increment_counter('historical_task_failures',
-                                                    {'exchange': task.exchange_slug, 'reason': 'max_retries'})
-
-    async def _save_historical_data(self, task: HistoricalDataTask, klines: List[List]) -> int:
-        """Save historical data to database"""
-        async with self.session_factory() as session:
-            try:
-                return await db_error_handler.execute_with_retry(
-                    session, self._save_klines_operation, task.exchange_slug, task.symbol, task.timeframe, klines
+                # Schedule chunk request with smart scheduler
+                await request_scheduler.schedule_request(
+                    exchange=task.exchange_slug,
+                    request_type=RequestType.HISTORICAL_BULK,
+                    function=fetch_chunk,
+                    priority=task.priority.value * 10,
+                    callback=chunk_callback
                 )
-            except Exception as e:
-                self.logger.error("Failed to save historical data after retries",
-                                  exchange=task.exchange_slug, symbol=task.symbol, timeframe=task.timeframe,
-                                  error=str(e))
-                return 0
 
-    async def _save_klines_operation(self, session: AsyncSession, exchange_slug: str, symbol: str,
-                                     timeframe: str, klines: List[List]) -> int:
-        """Database operation for saving klines"""
-        try:
-            trading_pair = await TradingPair.get_by_exchange_and_symbol(session, exchange_slug, symbol)
-            if not trading_pair:
-                return 0
+                # Brief pause between chunk scheduling
+                await asyncio.sleep(0.1)
 
-            return await HistoricalData.save_klines(session, trading_pair.id, timeframe, klines)
+            # Record completion metrics
+            completion_time = time.time() - start_time
+            self._record_completion_stats(task.exchange_slug, completion_time, total_saved)
+
+            self.logger.info("Smart fetch completed", task_id=task_id,
+                             total_saved=total_saved, duration=completion_time)
 
         except Exception as e:
-            self.logger.error("Failed to save historical data",
-                              exchange=exchange_slug, symbol=symbol, error=str(e))
+            self.logger.error("Smart fetch failed", task_id=task_id, error=str(e))
+            self._record_error_stats(task.exchange_slug)
+        finally:
+            # Clean up
+            if task_id in self.active_tasks:
+                del self.active_tasks[task_id]
+
+    def _calculate_optimal_chunks(self, task: HistoricalTask) -> List[Tuple[Optional[int], int]]:
+        """Calculate optimal chunks for data fetching"""
+        chunks = []
+
+        if not task.since:
+            # Simple case: just one chunk with limit
+            chunks.append((None, min(task.limit, task.chunk_size)))
+        else:
+            # Calculate time-based chunks
+            current_time = int(time.time() * 1000)
+            timeframe_ms = self._get_timeframe_minutes(task.timeframe) * 60 * 1000
+
+            chunk_time_span = task.chunk_size * timeframe_ms
+            current_since = task.since
+
+            while current_since < current_time:
+                chunk_until = min(current_since + chunk_time_span, current_time)
+                chunks.append((current_since, task.chunk_size))
+                current_since = chunk_until
+
+                if len(chunks) >= task.estimated_requests:
+                    break
+
+        return chunks
+
+    async def _save_chunk_data(self, task: HistoricalTask, klines: List[List]) -> int:
+        """Save chunk data to database"""
+        if not klines:
             return 0
 
-    def _can_make_request(self, exchange_slug: str) -> bool:
-        """Check if we can make a request to the exchange"""
-        if exchange_slug not in self.rate_limits:
-            return True
-
-        limit_info = self.rate_limits[exchange_slug]
-        current_time = time.time()
-
-        # Reset counter if minute has passed
-        if current_time - limit_info['reset_time'] >= 60:
-            limit_info['current'] = 0
-            limit_info['reset_time'] = current_time
-
-        return limit_info['current'] < limit_info['requests_per_minute']
-
-    def _increment_rate_limit(self, exchange_slug: str):
-        """Increment rate limit counter"""
-        if exchange_slug in self.rate_limits:
-            self.rate_limits[exchange_slug]['current'] += 1
-
-    async def _rate_limit_reset_loop(self):
-        """Reset rate limits periodically"""
-        while self.running:
+        async with self.session_factory() as session:
             try:
-                await asyncio.sleep(60)
-                current_time = time.time()
+                trading_pair = await TradingPair.get_by_exchange_and_symbol(
+                    session, task.exchange_slug, task.symbol
+                )
+                if not trading_pair:
+                    return 0
 
-                for exchange_slug, limit_info in self.rate_limits.items():
-                    if current_time - limit_info['reset_time'] >= 60:
-                        limit_info['current'] = 0
-                        limit_info['reset_time'] = current_time
+                return await HistoricalData.save_klines(
+                    session, trading_pair.id, task.timeframe, klines
+                )
 
             except Exception as e:
-                self.logger.error("Error in rate limit reset loop", error=str(e))
+                await session.rollback()
+                self.logger.error("Failed to save chunk data", error=str(e))
+                return 0
 
-    def get_service_stats(self) -> Dict[str, Any]:
-        """Get service statistics"""
+    def _record_completion_stats(self, exchange: str, duration: float, records_saved: int):
+        """Record completion statistics"""
+        if exchange not in self.completion_stats:
+            self.completion_stats[exchange] = []
+
+        self.completion_stats[exchange].append(duration)
+
+        # Keep only recent stats
+        if len(self.completion_stats[exchange]) > 100:
+            self.completion_stats[exchange] = self.completion_stats[exchange][-50:]
+
+        # Record metrics
+        metrics_collector.record_histogram('historical_task_duration', duration,
+                                           {'exchange': exchange})
+        metrics_collector.record_data_processing('historical', exchange, '',
+                                                 records_saved, duration)
+
+    def _record_error_stats(self, exchange: str):
+        """Record error statistics"""
+        current_rate = self.error_rates.get(exchange, 0)
+        self.error_rates[exchange] = min(current_rate + 0.1, 1.0)
+
+        metrics_collector.increment_counter('historical_task_errors', {'exchange': exchange})
+
+    def _get_timeframe_minutes(self, timeframe: str) -> int:
+        """Convert timeframe to minutes"""
+        timeframe_map = {
+            '1m': 1, '5m': 5, '15m': 15, '30m': 30,
+            '1h': 60, '4h': 240, '1d': 1440
+        }
+        return timeframe_map.get(timeframe, 60)
+
+    async def bulk_import_with_optimization(self, exchange_slug: str, symbols: List[str],
+                                            timeframes: List[str], days_back: int = 30) -> List[str]:
+        """Bulk import with full optimization"""
+
+        # Calculate optimal distribution strategy
+        strategy = rate_limiter.calculate_bulk_fetch_strategy(
+            exchange_slug, symbols[0], timeframes[0], days_back
+        )
+
+        if not strategy['can_start_immediately']:
+            self.logger.warning("Bulk import delayed due to capacity constraints",
+                                exchange=exchange_slug,
+                                estimated_wait=strategy['estimated_time_seconds'])
+
+        task_ids = []
+
+        # Optimize timeframe order
+        optimal_timeframes = rate_limiter.suggest_optimal_timeframes(
+            exchange_slug, timeframes
+        )
+
+        # Schedule tasks with staggered priorities
+        base_priority = TaskPriority.MEDIUM
+
+        for i, symbol in enumerate(symbols):
+            for j, timeframe in enumerate(optimal_timeframes):
+                # Stagger priorities to distribute load
+                priority_offset = (i + j) % 3
+                if priority_offset == 0:
+                    priority = TaskPriority.HIGH
+                elif priority_offset == 1:
+                    priority = base_priority
+                else:
+                    priority = TaskPriority.LOW
+
+                task_id = await self.schedule_optimized_task(
+                    exchange_slug=exchange_slug,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    priority=priority,
+                    since=int((datetime.now() - timedelta(days=days_back)).timestamp() * 1000),
+                    limit=strategy['batch_size']
+                )
+
+                task_ids.append(task_id)
+
+        self.logger.info("Bulk import scheduled with optimization",
+                         exchange=exchange_slug, symbols=len(symbols),
+                         timeframes=len(optimal_timeframes), total_tasks=len(task_ids))
+
+        return task_ids
+
+    async def get_optimization_stats(self) -> Dict[str, Any]:
+        """Get optimization statistics"""
         return {
-            'running': self.running,
-            'queue_size': len(self.task_queue),
-            'active_workers': len([t for t in self.active_tasks.values() if not t.done()]),
-            'rate_limits': {
+            'pending_tasks': len(self.pending_tasks),
+            'active_tasks': len(self.active_tasks),
+            'completion_stats': {
                 exchange: {
-                    'current': info['current'],
-                    'limit': info['requests_per_minute'],
-                    'remaining': info['requests_per_minute'] - info['current']
-                }
-                for exchange, info in self.rate_limits.items()
-            }
+                    'avg_duration': sum(times) / len(times) if times else 0,
+                    'total_completions': len(times)
+                } for exchange, times in self.completion_stats.items()
+            },
+            'error_rates': dict(self.error_rates),
+            'rate_limit_stats': rate_limiter.get_optimizer_stats(),
+            'scheduler_stats': await request_scheduler.get_queue_stats() if request_scheduler else {}
         }
 
-    async def validate_data_integrity(self, exchange_slug: str, symbol: str, timeframe: str,
-                                      days_back: int = 7) -> Dict[str, Any]:
-        """Validate data integrity for a trading pair"""
-        try:
-            async with self.session_factory() as session:
-                # Check for missing data in the last N days
-                query = """
-                SELECT 
-                    DATE(hd.timestamp) as date,
-                    COUNT(*) as count,
-                    MIN(hd.timestamp) as first_timestamp,
-                    MAX(hd.timestamp) as last_timestamp
-                FROM historical_data hd
-                JOIN trading_pairs tp ON hd.trading_pair_id = tp.id
-                JOIN exchanges e ON tp.exchange_id = e.id
-                WHERE e.slug = :exchange_slug 
-                AND tp.symbol = :symbol 
-                AND hd.timeframe = :timeframe
-                AND hd.timestamp >= DATE_SUB(NOW(), INTERVAL :days_back DAY)
-                GROUP BY DATE(hd.timestamp)
-                ORDER BY date DESC
-                """
+    async def shutdown(self):
+        """Shutdown optimized service"""
+        self.running = False
 
-                result = await session.execute(text(query), {
-                    'exchange_slug': exchange_slug,
-                    'symbol': symbol,
-                    'timeframe': timeframe,
-                    'days_back': days_back
-                })
+        if self.scheduler_task:
+            self.scheduler_task.cancel()
 
-                daily_stats = []
-                for row in result.fetchall():
-                    daily_stats.append({
-                        'date': row[0].isoformat(),
-                        'count': row[1],
-                        'first_timestamp': row[2].isoformat(),
-                        'last_timestamp': row[3].isoformat()
-                    })
+        # Cancel active tasks
+        for task in self.active_tasks.values():
+            task.cancel()
 
-            # Calculate expected counts per day
-            expected_per_day = 86400 // self._get_timeframe_seconds(timeframe)
+        await request_scheduler.shutdown()
 
-            # Analyze data quality
-            missing_days = []
-            incomplete_days = []
-
-            for stats in daily_stats:
-                if stats['count'] == 0:
-                    missing_days.append(stats['date'])
-                elif stats['count'] < expected_per_day * 0.9:  # Less than 90% of expected data
-                    incomplete_days.append({
-                        'date': stats['date'],
-                        'count': stats['count'],
-                        'expected': expected_per_day,
-                        'percentage': (stats['count'] / expected_per_day) * 100
-                    })
-
-            return {
-                'exchange': exchange_slug,
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'days_analyzed': days_back,
-                'total_days_with_data': len(daily_stats),
-                'missing_days': missing_days,
-                'incomplete_days': incomplete_days,
-                'data_quality_score': max(0, 100 - len(missing_days) * 10 - len(incomplete_days) * 5),
-                'daily_stats': daily_stats[:7]  # Last 7 days
-            }
-
-        except Exception as e:
-            self.logger.error("Error validating data integrity",
-                              exchange=exchange_slug, symbol=symbol, timeframe=timeframe, error=str(e))
-            return {}
+        self.logger.info("Optimized historical data service shutdown complete")
 
 
 # Global instance
-historical_data_service = HistoricalDataService()
+historical_data_service = OptimizedHistoricalDataService()

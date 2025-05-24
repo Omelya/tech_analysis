@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     websocket_max_connections: int = 100
     websocket_ping_interval: int = 20
     websocket_ping_timeout: int = 10
+    websocket_port: int = 8080
 
     # Data processing settings
     default_historical_limit: int = 1000
