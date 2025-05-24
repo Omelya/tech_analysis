@@ -40,7 +40,7 @@ async def get_system_status():
         # Get all service statuses
         exchange_status = await exchange_manager.get_all_exchanges_status()
         websocket_stats = websocket_server.get_server_stats()
-        historical_stats = historical_data_service.get_service_stats()
+        historical_stats = await historical_data_service.get_optimization_stats()
         metrics_summary = metrics_collector.get_metrics_summary()
 
         return {
@@ -431,7 +431,6 @@ async def get_system_config():
     try:
         from ...config import settings
 
-        # Return sanitized config (no secrets)
         config = {
             "debug": settings.debug,
             "host": settings.host,

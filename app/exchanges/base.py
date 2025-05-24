@@ -151,9 +151,15 @@ class RestExchangeAdapter(ExchangeAdapter):
     async def close(self) -> None:
         """Close exchange connection"""
         if self.exchange:
-            await self.exchange.close()
-            self.connection_status = ConnectionStatus.DISCONNECTED
-            self.logger.info("Exchange connection closed")
+            try:
+                await self.exchange.close()
+                self.logger.info("Exchange connection closed")
+            except Exception as e:
+                self.logger.error("Error closing exchange", error=str(e))
+            finally:
+                self.exchange = None
+
+        self.connection_status = ConnectionStatus.DISCONNECTED
 
     async def verify_credentials(self) -> bool:
         """Verify API credentials by fetching balance"""

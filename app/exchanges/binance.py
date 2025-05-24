@@ -331,8 +331,15 @@ class BinanceAdapter:
 
     async def close(self) -> None:
         """Close both REST and WebSocket connections"""
-        await self.rest.close()
-        await self.websocket.close()
+        try:
+            if self.rest:
+                await self.rest.close()
+            if self.websocket:
+                await self.websocket.close()
+
+            self.logger.info("Adapter closed successfully")
+        except Exception as e:
+            self.logger.error("Error closing adapter", error=str(e))
 
     async def get_connection_status(self) -> Dict[str, Any]:
         """Get combined connection status"""

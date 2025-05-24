@@ -145,21 +145,22 @@ class BybitWebSocketAdapter(WebSocketExchangeAdapter):
         await connection.send(json.dumps(message))
 
     async def _handle_message(self, message: str, callback: Callable):
-        """Handle incoming WebSocket message"""
         try:
             data = json.loads(message)
 
-            if data.get('success') and data.get('op') == 'subscribe':
-                self.logger.info("Subscription confirmed", data=data)
+            if not isinstance(data, dict):
                 return
 
-            if 'topic' in data and 'data' in data:
+            if 'id' in data and data.get('result') is not None:
+                self.logger.info("Subscription response", data=data)
+                return
+
+            if 'method' in data and 'params' in data:
                 normalized_data = self._normalize_message(data)
                 if normalized_data:
                     await callback(normalized_data)
-
         except Exception as e:
-            self.logger.error("Failed to handle WebSocket message", error=str(e), message=message[:100])
+            self.logger.error("Failed to handle WebSocket message", error=str(e))
 
     def _normalize_message(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize Bybit WebSocket message to standard format"""
@@ -377,8 +378,15 @@ class BybitAdapter:
 
     async def close(self) -> None:
         """Close both REST and WebSocket connections"""
-        await self.rest.close()
-        await self.websocket.close()
+        try:
+            if self.rest:
+                await self.rest.close()
+            if self.websocket:
+                await self.websocket.close()
+
+            self.logger.info("Adapter closed successfully")
+        except Exception as e:
+            self.logger.error("Error closing adapter", error=str(e))
 
     async def get_connection_status(self) -> Dict[str, Any]:
         """Get combined connection status"""

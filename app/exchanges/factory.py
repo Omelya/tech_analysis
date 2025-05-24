@@ -16,6 +16,8 @@ class ExchangeFactory:
         'whitebit': WhiteBitAdapter
     }
 
+    _instances: Dict[str, ExchangeAdapter] = {}
+
     @classmethod
     def create_adapter(cls, exchange_id: str) -> Optional[ExchangeAdapter]:
         """Create new exchange adapter instance (no caching here)"""
@@ -50,3 +52,27 @@ class ExchangeFactory:
     def get_adapter_class(cls, exchange_id: str) -> Optional[type]:
         """Get adapter class for exchange"""
         return cls._adapters.get(exchange_id)
+
+    @classmethod
+    async def get_adapter_status(cls, exchange_id: str) -> Dict[str, Any]:
+        """Get status of all adapters for specific exchange"""
+        status_list = []
+
+        for cache_key, adapter in cls._instances.items():
+            if cache_key.startswith(exchange_id):
+                try:
+                    status = await adapter.get_connection_status()
+                    status['cache_key'] = cache_key
+                    status_list.append(status)
+                except Exception as e:
+                    status_list.append({
+                        'cache_key': cache_key,
+                        'status': 'error',
+                        'error': str(e)
+                    })
+
+        return {
+            'exchange_id': exchange_id,
+            'total_adapters': len(status_list),
+            'adapters': status_list
+        }
