@@ -1,13 +1,12 @@
 import asyncio
 import time
-from typing import Dict, List, Optional, Any, Callable, Union
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import deque, defaultdict
 import structlog
-from datetime import datetime, timedelta
+from datetime import datetime
 import statistics
-import json
 import psutil
 
 
@@ -243,6 +242,7 @@ class MonitoringSystem:
         if self.metrics[metric_name]:
             last_value = self.metrics[metric_name][-1].value
 
+        return [last_value, value]
         self.record_metric(metric_name, last_value + value, tags)
 
     def set_gauge(self, metric_name: str, value: float, tags: Dict[str, str] = None):

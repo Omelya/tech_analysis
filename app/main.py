@@ -9,10 +9,9 @@ from .exchanges.manager import exchange_manager
 from .api.routes import exchange_routes, admin_routes
 from .utils.logging import setup_logging
 
-# Import new stream processing components
 from .stream_processing.stream_processor import StreamProcessor, StreamProcessorConfig
 from .stream_processing.monitoring_system import monitoring_system
-from .stream_processing.database_optimizer import initialize_database_optimizer
+from .stream_processing.database_optimizer import database_optimizer
 
 
 def create_app() -> FastAPI:
@@ -61,7 +60,7 @@ def create_app() -> FastAPI:
             await migrator.add_indexes()
 
             # Initialize database optimizer
-            await initialize_database_optimizer(settings.database_url)
+            await database_optimizer.initialize()
             logger.info("Database optimizer initialized")
 
             # 3. Initialize exchange manager
@@ -237,7 +236,6 @@ def create_app() -> FastAPI:
             logger.error("Failed to get metrics", error=str(e))
             raise HTTPException(status_code=500, detail="Failed to get metrics")
 
-    # New endpoints for stream processing control
     @app.post("/api/v1/stream/process")
     async def process_stream_data(exchange: str, symbol: str, message_type: str, data: dict):
         """Process WebSocket message through stream processor"""
@@ -324,14 +322,18 @@ async def setup_data_flows(stream_processor: StreamProcessor):
                 active_pairs = await TradingPair.get_active_pairs(session)
                 logger.info("Loaded active trading pairs", count=len(active_pairs))
 
-        await setup_websocket_integration(stream_processor)
+                for pair in active_pairs:
+                    exchange_slug = pair['exchange_slug']
+                    symbol = pair['symbol']
 
+                    await setup_exchange_subscriptions(exchange_slug, symbol)
+
+        await setup_websocket_integration(stream_processor)
         logger.info("Data flows setup complete")
 
     except Exception as e:
         logger.error("Failed to setup data flows", error=str(e))
         raise
-
 
 async def setup_websocket_integration(stream_processor: StreamProcessor):
     """Setup WebSocket message routing to stream processor"""
@@ -351,6 +353,44 @@ async def setup_websocket_integration(stream_processor: StreamProcessor):
     from .services.websocket_server import websocket_server
     websocket_server.message_router = route_websocket_message
 
+async def setup_exchange_subscriptions(exchange_slug: str, symbol: str):
+    """Налаштування підписок для біржі"""
+    logger = structlog.get_logger()
+
+    try:
+        adapter = await exchange_manager.get_public_adapter(exchange_slug)
+        if not adapter:
+            logger.warning(f"No adapter for {exchange_slug}")
+            return
+
+        # Callback для обробки даних
+        async def data_callback(data):
+            """Обробка WebSocket даних"""
+            try:
+                # Відправте дані до stream processor
+                if hasattr(app.state, 'stream_processor'):
+                    await app.state.stream_processor.process_message(
+                        exchange=exchange_slug,
+                        symbol=symbol,
+                        message_type=data.get('type', 'ticker'),
+                        data=data.get('data', {})
+                    )
+                    logger.debug("WebSocket data processed",
+                               exchange=exchange_slug, symbol=symbol)
+            except Exception as e:
+                logger.error("Failed to process WebSocket data",
+                           exchange=exchange_slug, symbol=symbol, error=str(e))
+
+        if hasattr(adapter, 'websocket') and adapter.websocket:
+            success = await adapter.websocket.subscribe_ticker(symbol, data_callback)
+            if success:
+                logger.info("Subscribed to ticker", exchange=exchange_slug, symbol=symbol)
+            else:
+                logger.error("Failed to subscribe to ticker", exchange=exchange_slug, symbol=symbol)
+
+    except Exception as e:
+        logger.error("Failed to setup subscription",
+                   exchange=exchange_slug, symbol=symbol, error=str(e))
 
 # Create app instance
 app = create_app()

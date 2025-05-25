@@ -2,7 +2,7 @@
 
 Високопродуктивний мікросервіс для обробки криптовалютних даних з інтелектуальною системою stream processing, адаптивним буферуванням та автоматичним захистом від перевантаження.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115.0-green.svg)](https://fastapi.tiangolo.com)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0+-orange.svg)](https://mysql.com)
 [![Redis](https://img.shields.io/badge/Redis-7.0+-red.svg)](https://redis.io)
@@ -128,8 +128,8 @@ GET  /api/v1/admin/alerts             # Активні алерти
 
 ### **🌐 WebSocket**
 ```http
-GET  /api/v1/stream/websocket/clients # Інформація про клієнтів
-POST /api/v1/stream/websocket/broadcast # Тестові повідомлення
+GET  /api/v1/websocket/clients # Інформація про клієнтів
+POST /api/v1/websocket/broadcast # Тестові повідомлення
 ```
 
 ## ⚙️ **Конфігурація продуктивності**
@@ -315,7 +315,6 @@ tail -f logs/app.log | jq 'select(.level == "ERROR")'
 
 ## 📚 **Документація**
 
-- 📖 **[Повне керівництво з інтеграції](INTEGRATION_GUIDE.md)**
 - 🔗 **[API документація](http://localhost:8000/docs)** (Swagger UI)
 - 📊 **[Метрики](http://localhost:8000/metrics)** (Prometheus)
 - 🔍 **[Моніторинг](http://localhost:8000/redoc)** (ReDoc)

@@ -10,9 +10,7 @@ from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text, insert, update, select
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.exc import SQLAlchemyError, DisconnectionError, OperationalError
-import aiomysql
+from ..config import settings
 
 
 class WriteOperation(Enum):
@@ -40,8 +38,8 @@ class BatchOperation:
 class DatabaseOptimizer:
     """High-performance database optimizer with batching and connection pooling"""
 
-    def __init__(self, database_url: str):
-        self.database_url = database_url
+    def __init__(self):
+        self.database_url = settings.database_url
         self.logger = structlog.get_logger().bind(component="database_optimizer")
 
         # Connection management
@@ -114,14 +112,12 @@ class DatabaseOptimizer:
                 pool_size=self.connection_pool_size,
                 max_overflow=self.max_overflow,
                 pool_pre_ping=True,
-                pool_recycle=3600,  # 1 hour
+                pool_recycle=3600,
                 echo=False,
                 connect_args={
                     "charset": "utf8mb4",
                     "autocommit": False,
                     "connect_timeout": 10,
-                    "read_timeout": 30,
-                    "write_timeout": 30
                 }
             )
 
@@ -646,12 +642,4 @@ class DatabaseOptimizer:
 
 
 # Global instance - will be initialized with database URL
-database_optimizer = None
-
-
-async def initialize_database_optimizer(database_url: str):
-    """Initialize global database optimizer"""
-    global database_optimizer
-    database_optimizer = DatabaseOptimizer(database_url)
-    await database_optimizer.initialize()
-    return database_optimizer
+database_optimizer = DatabaseOptimizer()

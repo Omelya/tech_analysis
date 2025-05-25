@@ -81,7 +81,7 @@ class WebSocketServer:
             self.subscriptions[client_id] = set()
 
             self.logger.info("Client connected", client_id=client_id, path=path)
-            monitoring_system.increment_counter('websocket_connections', {'status': 'connected'})
+            monitoring_system.increment_counter(metric_name='websocket_connections', tags={'status': 'connected'})
 
             # Send welcome message
             await self._send_to_client(client_id, {
@@ -279,7 +279,7 @@ class WebSocketServer:
 
             del self.subscriptions[client_id]
 
-        monitoring_system.increment_counter('websocket_connections', {'status': 'disconnected'})
+        monitoring_system.increment_counter(metric_name='websocket_connections', tags={'status': 'disconnected'})
 
     # Stream data handling methods - these are called by stream processing system
     async def broadcast_ticker_data(self, exchange: str, symbol: str, data: Dict[str, Any]):
