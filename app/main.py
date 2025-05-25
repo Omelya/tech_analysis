@@ -9,16 +9,21 @@ from .exchanges.manager import exchange_manager
 from .api.routes import exchange_routes, admin_routes
 from .utils.logging import setup_logging
 
+# Import new stream processing components
+from .stream_processing.stream_processor import StreamProcessor, StreamProcessorConfig
+from .stream_processing.monitoring_system import monitoring_system
+from .stream_processing.database_optimizer import initialize_database_optimizer
+
 
 def create_app() -> FastAPI:
-    """Create FastAPI application instance with full optimization"""
+    """Create FastAPI application with stream processing integration"""
 
     setup_logging()
 
     app = FastAPI(
-        title="Crypto Data Microservice",
-        description="Optimized microservice for fetching and processing cryptocurrency data",
-        version="2.0.0",
+        title="High-Performance Crypto Data Microservice",
+        description="Advanced microservice for processing cryptocurrency data with intelligent stream handling",
+        version="3.0.0",
         debug=settings.debug
     )
 
@@ -30,7 +35,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Include all routers
+    # Include API routers
     app.include_router(exchange_routes.router, prefix="/api/v1", tags=["exchanges"])
     app.include_router(admin_routes.router, prefix="/api/v1/admin", tags=["admin"])
 
@@ -38,183 +43,166 @@ def create_app() -> FastAPI:
     from .api.routes.stream_routes import router as stream_router
     app.include_router(stream_router, prefix="/api/v1", tags=["streams"])
 
-    # Add optimized historical routes
-    from .api.routes.historical_routes import router as historical_router
-    app.include_router(historical_router, prefix="/api/v1", tags=["historical-optimized"])
-
     @app.on_event("startup")
     async def startup_event():
-        """Initialize all services with optimization"""
+        """Initialize all systems with new stream processing architecture"""
         logger = structlog.get_logger()
-        logger.info("Starting optimized crypto data microservice v2.0")
+        logger.info("Starting High-Performance Crypto Data Microservice v3.0")
 
-        # 1. Initialize database migrations
-        from .models.migrations import migrator
-        await migrator.initialize()
-        await migrator.ensure_tables_exist()
-        await migrator.add_indexes()
+        try:
+            # 1. Initialize monitoring system first
+            await monitoring_system.initialize()
+            logger.info("Monitoring system initialized")
 
-        # 2. Initialize exchange manager
-        await exchange_manager.initialize()
+            # 2. Initialize database migrations and optimizer
+            from .models.migrations import migrator
+            await migrator.initialize()
+            await migrator.ensure_tables_exist()
+            await migrator.add_indexes()
 
-        # 3. Initialize rate limit optimizer
-        logger.info("Rate limit optimizer initialized")
+            # Initialize database optimizer
+            await initialize_database_optimizer(settings.database_url)
+            logger.info("Database optimizer initialized")
 
-        # 4. Initialize smart request scheduler
-        from .services.request_scheduler import request_scheduler
-        await request_scheduler.initialize()
+            # 3. Initialize exchange manager
+            await exchange_manager.initialize()
+            logger.info("Exchange manager initialized")
 
-        # 5. Initialize optimized historical data service
-        from .services.historical_data_service import historical_data_service
-        from .services.data_processor import data_processor
-        await data_processor.initialize()
-        await historical_data_service.initialize(data_processor.session_factory)
+            # 4. Create and initialize stream processor
+            stream_config = StreamProcessorConfig({
+                'database_url': settings.database_url,
+                'performance_mode': 'medium',
+                'buffer_settings': {
+                    'ticker': {'max_size': 10, 'max_age_ms': 500},
+                    'orderbook': {'max_size': 5, 'max_age_ms': 200},
+                    'klines': {'max_size': 2, 'max_age_ms': 1000},
+                    'trades': {'max_size': 50, 'max_age_ms': 100}
+                },
+                'worker_settings': {
+                    'fast': {'min': 2, 'max': 4},
+                    'medium': {'min': 2, 'max': 3},
+                    'slow': {'min': 1, 'max': 2}
+                }
+            })
 
-        # 6. Initialize stream integration
-        from .services.stream_integration import stream_integration
-        await stream_integration.initialize()
+            app.state.stream_processor = StreamProcessor(stream_config.__dict__)
+            await app.state.stream_processor.initialize()
+            logger.info("Stream processor initialized")
 
-        # 7. Initialize WebSocket server
-        from .services.websocket_server import websocket_server
-        asyncio.create_task(websocket_server.start_server(port=settings.websocket_port))
+            # 5. Start WebSocket integrations
+            from .services.websocket_server import websocket_server
+            asyncio.create_task(websocket_server.start_server(port=settings.websocket_port))
+            logger.info("WebSocket server started")
 
-        # 8. Start all processing services
-        await data_processor.start_automatic_processing()
-        await stream_integration.start_real_time_streams()
+            # 6. Setup data flows
+            await setup_data_flows(app.state.stream_processor)
+            logger.info("Data flows configured")
 
-        logger.info("Optimized application startup complete - all systems operational")
+            logger.info("High-Performance Crypto Data Microservice startup complete")
+
+        except Exception as e:
+            logger.error("Failed to initialize application", error=str(e))
+            raise
 
     @app.on_event("shutdown")
     async def shutdown_event():
-        """Graceful shutdown with optimization cleanup"""
+        """Graceful shutdown with stream processing cleanup"""
         logger = structlog.get_logger()
-        logger.info("Shutting down optimized crypto data microservice")
+        logger.info("Shutting down High-Performance Crypto Data Microservice")
 
-        # Stop services in reverse order
         try:
-            # 1. Stop stream integration
-            from .services.stream_integration import stream_integration
-            await stream_integration.shutdown()
+            # 1. Stop stream processor
+            if hasattr(app.state, 'stream_processor'):
+                await app.state.stream_processor.shutdown()
+                logger.info("Stream processor shutdown complete")
 
             # 2. Stop WebSocket server
             from .services.websocket_server import websocket_server
             await websocket_server.stop_server()
+            logger.info("WebSocket server stopped")
 
-            # 3. Stop optimized historical service
-            from .services.historical_data_service import historical_data_service
-            await historical_data_service.shutdown()
-
-            # 4. Stop smart scheduler
-            from .services.request_scheduler import smart_scheduler
-            await smart_scheduler.shutdown()
-
-            # 5. Stop data processor
-            from .services.data_processor import data_processor
-            await data_processor.stop_all_tasks()
-
-            # 6. Shutdown exchange manager
+            # 3. Shutdown exchange manager
             await exchange_manager.shutdown()
+            logger.info("Exchange manager shutdown")
 
-            # 7. Close database connections
+            # 4. Shutdown monitoring
+            await monitoring_system.shutdown()
+            logger.info("Monitoring system shutdown")
+
+            # 5. Close database connections
             from .models.migrations import migrator
             await migrator.close()
+            logger.info("Database connections closed")
 
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
 
-        logger.info("Optimized application shutdown complete")
+        logger.info("Application shutdown complete")
 
     @app.get("/")
     async def root():
-        """Root endpoint with optimization info"""
-        from app.utils.rate_limiter import rate_limiter
+        """Root endpoint with system information"""
+        if not hasattr(app.state, 'stream_processor'):
+            return {"error": "Stream processor not initialized"}
 
-        optimization_status = {}
-        for exchange in exchange_manager.get_supported_exchanges():
-            capacity = rate_limiter.get_exchange_capacity(exchange)
-            optimization_status[exchange] = {
-                'capacity_remaining_pct': round(
-                    (capacity.get('requests_remaining', 0) / 1200) * 100, 1
-                ),
-                'adaptive_delay_factor': capacity.get('adaptive_delay_factor', 1.0),
-                'status': 'optimal' if capacity.get('requests_remaining', 0) > 500 else 'throttled'
+        try:
+            stats = app.state.stream_processor.get_stats()
+            health = await app.state.stream_processor.health_check()
+
+            return {
+                "service": "High-Performance Crypto Data Microservice",
+                "version": "3.0.0",
+                "status": health['overall'],
+                "features": [
+                    "intelligent_stream_processing",
+                    "adaptive_buffer_management",
+                    "dynamic_task_queuing",
+                    "smart_backpressure_control",
+                    "database_optimization",
+                    "comprehensive_monitoring",
+                    "circuit_breaker_protection",
+                    "auto_scaling_workers"
+                ],
+                "performance": {
+                    "uptime_seconds": stats['uptime_seconds'],
+                    "messages_processed": stats['total_messages_processed'],
+                    "processing_rate": stats.get('processing_rate', 0),
+                    "drop_rate_percent": stats.get('drop_rate_percent', 0)
+                },
+                "supported_exchanges": exchange_manager.get_supported_exchanges(),
+                "websocket_port": settings.websocket_port
             }
 
-        return {
-            "service": "Crypto Data Microservice",
-            "version": "2.0.0",
-            "status": "running",
-            "optimization_enabled": True,
-            "supported_exchanges": exchange_manager.get_supported_exchanges(),
-            "websocket_port": 8001,
-            "features": [
-                "intelligent_rate_limiting",
-                "smart_request_scheduling",
-                "optimized_historical_fetching",
-                "real_time_streaming",
-                "laravel_integration"
-            ],
-            "exchange_optimization_status": optimization_status
-        }
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to get root status", error=str(e))
+            raise HTTPException(status_code=500, detail="Failed to get system status")
 
     @app.get("/health")
     async def health_check():
-        """Comprehensive health check with optimization metrics"""
+        """Comprehensive health check"""
         try:
-            # Basic service status
+            if not hasattr(app.state, 'stream_processor'):
+                return {"status": "unhealthy", "error": "Stream processor not initialized"}
+
+            # Get comprehensive health from stream processor
+            health_data = await app.state.stream_processor.health_check()
+
+            # Add exchange status
             exchange_status = await exchange_manager.get_all_exchanges_status()
-
-            # WebSocket server status
-            from .services.websocket_server import websocket_server
-            ws_stats = websocket_server.get_server_stats()
-
-            # Stream integration status
-            from .services.stream_integration import stream_integration
-            stream_stats = stream_integration.get_integration_stats()
-
-            # Optimization status
-            from app.utils.rate_limiter import rate_limiter
-            from .services.request_scheduler import request_scheduler
-            from .services.historical_data_service import historical_data_service
-
-            optimization_stats = {
-                'rate_limiter': rate_limiter.get_optimizer_stats(),
-                'smart_scheduler': await request_scheduler.get_queue_stats(),
-                'historical_service': await historical_data_service.get_optimization_stats()
+            health_data['components']['exchanges'] = {
+                'healthy': exchange_status.get('total_exchanges', 0) > 0,
+                'details': exchange_status
             }
 
-            # Overall health score
-            health_score = 100.0
-            issues = []
-
-            # Check for issues
-            if exchange_status.get('total_exchanges', 0) == 0:
-                health_score -= 30
-                issues.append("No exchanges connected")
-
-            if not ws_stats.get('running', False):
-                health_score -= 20
-                issues.append("WebSocket server not running")
-
-            if sum(opt['consecutive_rate_limits'] for opt in
-                   optimization_stats['rate_limiter']['exchanges'].values()) > 5:
-                health_score -= 15
-                issues.append("Multiple rate limit issues")
-
-            status = "healthy" if health_score >= 80 else "degraded" if health_score >= 50 else "unhealthy"
-
-            return {
-                "status": status,
-                "health_score": round(health_score, 1),
-                "issues": issues,
-                "services": {
-                    "exchanges": exchange_status,
-                    "websocket": ws_stats,
-                    "streams": stream_stats,
-                    "optimization": optimization_stats,
-                },
-                "timestamp": exchange_status.get('timestamp')
+            # Add monitoring status
+            monitoring_status = monitoring_system.get_comprehensive_status()
+            health_data['components']['monitoring'] = {
+                'healthy': monitoring_status.get('health_score', 0) > 50,
+                'details': monitoring_status
             }
+
+            return health_data
 
         except Exception as e:
             logger = structlog.get_logger()
@@ -223,22 +211,24 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics")
     async def get_comprehensive_metrics():
-        """Get comprehensive service metrics"""
+        """Get comprehensive system metrics"""
         try:
-            from .utils.metrics_collector import metrics_collector
-            from app.utils.rate_limiter import rate_limiter
-            from .services.request_scheduler import request_scheduler
-            from .services.historical_data_service import historical_data_service
+            if not hasattr(app.state, 'stream_processor'):
+                return {"error": "Stream processor not initialized"}
+
+            # Get metrics from all systems
+            stream_stats = app.state.stream_processor.get_stats()
+            monitoring_status = monitoring_system.get_comprehensive_status()
+            exchange_status = await exchange_manager.get_all_exchanges_status()
 
             return {
                 "status": "success",
+                "timestamp": monitoring_status.get('timestamp'),
                 "data": {
-                    "general_metrics": metrics_collector.get_metrics_summary(),
-                    "optimization_metrics": {
-                        "rate_limiting": rate_limiter.get_optimizer_stats(),
-                        "smart_scheduling": await request_scheduler.get_queue_stats(),
-                        "historical_optimization": await historical_data_service.get_optimization_stats()
-                    }
+                    "stream_processor": stream_stats,
+                    "monitoring": monitoring_status,
+                    "exchanges": exchange_status,
+                    "system_health_score": monitoring_status.get('health_score', 0)
                 }
             }
 
@@ -247,9 +237,122 @@ def create_app() -> FastAPI:
             logger.error("Failed to get metrics", error=str(e))
             raise HTTPException(status_code=500, detail="Failed to get metrics")
 
+    # New endpoints for stream processing control
+    @app.post("/api/v1/stream/process")
+    async def process_stream_data(exchange: str, symbol: str, message_type: str, data: dict):
+        """Process WebSocket message through stream processor"""
+        try:
+            if not hasattr(app.state, 'stream_processor'):
+                raise HTTPException(status_code=503, detail="Stream processor not available")
+
+            success = await app.state.stream_processor.process_message(
+                exchange, symbol, message_type, data
+            )
+
+            return {
+                "status": "success" if success else "throttled",
+                "processed": success
+            }
+
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to process stream data", error=str(e))
+            raise HTTPException(status_code=500, detail="Failed to process stream data")
+
+    @app.get("/api/v1/stream/stats")
+    async def get_stream_stats():
+        """Get detailed stream processing statistics"""
+        try:
+            if not hasattr(app.state, 'stream_processor'):
+                raise HTTPException(status_code=503, detail="Stream processor not available")
+
+            return {
+                "status": "success",
+                "data": app.state.stream_processor.get_stats()
+            }
+
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to get stream stats", error=str(e))
+            raise HTTPException(status_code=500, detail="Failed to get stream stats")
+
+    @app.post("/api/v1/emergency/throttle")
+    async def emergency_throttle(throttle_percent: int = 90):
+        """Apply emergency throttling"""
+        try:
+            if not hasattr(app.state, 'stream_processor'):
+                raise HTTPException(status_code=503, detail="Stream processor not available")
+
+            # Apply throttling through backpressure controller
+            backpressure = app.state.stream_processor.backpressure_controller
+
+            # Set high throttle level
+            from app.stream_processing.backpressure_controller import ThrottleLevel
+            if throttle_percent >= 90:
+                backpressure.throttle_level = ThrottleLevel.SEVERE
+            elif throttle_percent >= 75:
+                backpressure.throttle_level = ThrottleLevel.HEAVY
+            elif throttle_percent >= 50:
+                backpressure.throttle_level = ThrottleLevel.MODERATE
+            else:
+                backpressure.throttle_level = ThrottleLevel.LIGHT
+
+            return {
+                "status": "success",
+                "message": f"Emergency throttle applied at {throttle_percent}%",
+                "throttle_level": backpressure.throttle_level.name
+            }
+
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to apply emergency throttle", error=str(e))
+            raise HTTPException(status_code=500, detail="Failed to apply emergency throttle")
+
     return app
 
 
+async def setup_data_flows(stream_processor: StreamProcessor):
+    """Setup data flows between components"""
+    logger = structlog.get_logger()
+
+    try:
+        from .models.database import TradingPair
+        from .stream_processing.database_optimizer import database_optimizer
+
+        if database_optimizer:
+            async with database_optimizer._get_session() as session:
+                active_pairs = await TradingPair.get_active_pairs(session)
+                logger.info("Loaded active trading pairs", count=len(active_pairs))
+
+        await setup_websocket_integration(stream_processor)
+
+        logger.info("Data flows setup complete")
+
+    except Exception as e:
+        logger.error("Failed to setup data flows", error=str(e))
+        raise
+
+
+async def setup_websocket_integration(stream_processor: StreamProcessor):
+    """Setup WebSocket message routing to stream processor"""
+
+    # This function will be called by WebSocket handlers to route messages
+    async def route_websocket_message(exchange: str, symbol: str, message_type: str, data: dict):
+        """Route WebSocket message to stream processor"""
+        try:
+            await stream_processor.process_message(exchange, symbol, message_type, data)
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to route WebSocket message",
+                         exchange=exchange, symbol=symbol,
+                         message_type=message_type, error=str(e))
+
+    # Store routing function for use by WebSocket handlers
+    from .services.websocket_server import websocket_server
+    websocket_server.message_router = route_websocket_message
+
+
+# Create app instance
 app = create_app()
 
 if __name__ == "__main__":

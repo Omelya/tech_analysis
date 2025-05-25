@@ -1,19 +1,18 @@
 import asyncio
 import json
 import time
-from typing import Dict, Set, Optional, Any, List
+from typing import Dict, Set, Optional, Any, List, Callable
 from datetime import datetime
 import websockets
 from websockets.legacy.server import WebSocketServerProtocol
 import structlog
 
 from ..config import settings
-from ..utils.metrics_collector import metrics_collector
-from .data_processor import data_processor
+from ..stream_processing.monitoring_system import monitoring_system
 
 
 class WebSocketServer:
-    """WebSocket server for real-time data streaming to Laravel"""
+    """WebSocket server integrated with stream processing system"""
 
     def __init__(self):
         self.logger = structlog.get_logger().bind(component="websocket_server")
@@ -21,21 +20,15 @@ class WebSocketServer:
         self.subscriptions: Dict[str, Set[str]] = {}  # client_id -> set of subscription keys
         self.reverse_subscriptions: Dict[str, Set[str]] = {}  # subscription_key -> set of client_ids
 
-        # Buffer for data aggregation
-        self.data_buffers: Dict[str, Dict[str, Any]] = {}
-        self.buffer_timers: Dict[str, asyncio.Task] = {}
-
         # Server instance
         self.server = None
         self.running = False
 
-        # Stream management
-        self.stream_handlers = {
-            'ticker': self._handle_ticker_stream,
-            'orderbook': self._handle_orderbook_stream,
-            'klines': self._handle_klines_stream,
-            'trades': self._handle_trades_stream
-        }
+        # Message routing to stream processor
+        self.message_router: Optional[Callable] = None
+
+        # Stream data cache for clients
+        self.stream_cache: Dict[str, Any] = {}
 
     async def start_server(self, host: str = "0.0.0.0", port: int = 8001):
         """Start WebSocket server"""
@@ -53,9 +46,6 @@ class WebSocketServer:
             self.running = True
             self.logger.info("WebSocket server started", host=host, port=port)
 
-            # Start data streaming tasks
-            await self._start_data_streams()
-
         except Exception as e:
             self.logger.error("Failed to start WebSocket server", error=str(e))
             raise
@@ -64,11 +54,6 @@ class WebSocketServer:
         """Stop WebSocket server"""
         try:
             self.running = False
-
-            # Cancel buffer timers
-            for timer in self.buffer_timers.values():
-                timer.cancel()
-            self.buffer_timers.clear()
 
             # Close all client connections
             if self.clients:
@@ -96,14 +81,15 @@ class WebSocketServer:
             self.subscriptions[client_id] = set()
 
             self.logger.info("Client connected", client_id=client_id, path=path)
-            metrics_collector.increment_counter('websocket_connections', {'status': 'connected'})
+            monitoring_system.increment_counter('websocket_connections', {'status': 'connected'})
 
             # Send welcome message
             await self._send_to_client(client_id, {
                 'type': 'connection',
                 'status': 'connected',
                 'client_id': client_id,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'features': ['stream_processing', 'real_time_data', 'smart_buffering']
             })
 
             # Handle client messages
@@ -129,6 +115,8 @@ class WebSocketServer:
                 await self._handle_unsubscribe(client_id, data)
             elif message_type == 'ping':
                 await self._handle_ping(client_id)
+            elif message_type == 'get_stats':
+                await self._handle_get_stats(client_id)
             else:
                 await self._send_error(client_id, f"Unknown message type: {message_type}")
 
@@ -172,9 +160,18 @@ class WebSocketServer:
                 'timestamp': datetime.now().isoformat()
             })
 
+            # Send cached data if available
+            if subscription_key in self.stream_cache:
+                await self._send_to_client(client_id, {
+                    'type': 'data',
+                    'subscription': subscription_key,
+                    'data': self.stream_cache[subscription_key],
+                    'cached': True
+                })
+
             self.logger.info("Client subscribed",
                              client_id=client_id, subscription=subscription_key)
-            metrics_collector.increment_counter('websocket_subscriptions',
+            monitoring_system.increment_counter('websocket_subscriptions',
                                                 {'stream': stream_type, 'exchange': exchange})
 
         except Exception as e:
@@ -220,8 +217,25 @@ class WebSocketServer:
         """Handle ping message"""
         await self._send_to_client(client_id, {
             'type': 'pong',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'server_time': time.time()
         })
+
+    async def _handle_get_stats(self, client_id: str):
+        """Handle stats request"""
+        try:
+            stats = self.get_server_stats()
+            system_stats = monitoring_system.get_comprehensive_status()
+
+            await self._send_to_client(client_id, {
+                'type': 'stats',
+                'websocket_stats': stats,
+                'system_stats': system_stats,
+                'timestamp': datetime.now().isoformat()
+            })
+        except Exception as e:
+            self.logger.error("Error getting stats", client_id=client_id, error=str(e))
+            await self._send_error(client_id, "Failed to get stats")
 
     async def _send_to_client(self, client_id: str, data: Dict[str, Any]):
         """Send data to specific client"""
@@ -230,7 +244,7 @@ class WebSocketServer:
 
         try:
             websocket = self.clients[client_id]
-            message = json.dumps(data)
+            message = json.dumps(data, default=str)
             await websocket.send(message)
 
         except websockets.exceptions.ConnectionClosed:
@@ -265,60 +279,15 @@ class WebSocketServer:
 
             del self.subscriptions[client_id]
 
-        metrics_collector.increment_counter('websocket_connections', {'status': 'disconnected'})
+        monitoring_system.increment_counter('websocket_connections', {'status': 'disconnected'})
 
-    async def _start_data_streams(self):
-        """Start background tasks for data streaming"""
-        # Start buffer flush task
-        asyncio.create_task(self._buffer_flush_loop())
-
-        self.logger.info("Data streaming tasks started")
-
-    async def _buffer_flush_loop(self):
-        """Periodically flush buffered data"""
-        while self.running:
-            try:
-                await asyncio.sleep(0.1)  # Flush every 100ms
-                await self._flush_all_buffers()
-
-            except Exception as e:
-                self.logger.error("Error in buffer flush loop", error=str(e))
-
-    async def _flush_all_buffers(self):
-        """Flush all data buffers"""
-        current_time = time.time()
-
-        for subscription_key, buffer_data in list(self.data_buffers.items()):
-            # Check if buffer should be flushed (age > 100ms or size > threshold)
-            buffer_age = current_time - buffer_data.get('timestamp', 0)
-
-            if buffer_age > 0.1 or len(buffer_data.get('data', [])) > 10:
-                await self._flush_buffer(subscription_key)
-
-    async def _flush_buffer(self, subscription_key: str):
-        """Flush specific buffer"""
-        if subscription_key not in self.data_buffers:
-            return
-
-        buffer_data = self.data_buffers.pop(subscription_key)
-
-        if subscription_key in self.reverse_subscriptions:
-            clients = self.reverse_subscriptions[subscription_key].copy()
-
-            # Send to all subscribed clients
-            tasks = []
-            for client_id in clients:
-                tasks.append(self._send_to_client(client_id, buffer_data))
-
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Stream-specific handlers
-    async def _handle_ticker_stream(self, exchange: str, symbol: str, data: Dict[str, Any]):
-        """Handle ticker stream data"""
+    # Stream data handling methods - these are called by stream processing system
+    async def broadcast_ticker_data(self, exchange: str, symbol: str, data: Dict[str, Any]):
+        """Broadcast ticker data to subscribed clients"""
         subscription_key = f"ticker:{exchange}:{symbol}"
 
-        stream_data = {
+        # Cache data
+        self.stream_cache[subscription_key] = {
             'type': 'ticker',
             'exchange': exchange,
             'symbol': symbol,
@@ -326,27 +295,36 @@ class WebSocketServer:
             'timestamp': datetime.now().isoformat()
         }
 
-        await self._buffer_data(subscription_key, stream_data)
+        await self._broadcast_to_subscribers(subscription_key, self.stream_cache[subscription_key])
 
-    async def _handle_orderbook_stream(self, exchange: str, symbol: str, data: Dict[str, Any]):
-        """Handle orderbook stream data"""
+    async def broadcast_orderbook_data(self, exchange: str, symbol: str, data: Dict[str, Any]):
+        """Broadcast orderbook data to subscribed clients"""
         subscription_key = f"orderbook:{exchange}:{symbol}"
 
-        stream_data = {
+        # Cache data (limited to prevent memory bloat)
+        cached_data = {
             'type': 'orderbook',
             'exchange': exchange,
             'symbol': symbol,
-            'data': data,
+            'data': {
+                'bids': data.get('bids', [])[:10],  # Top 10 levels only
+                'asks': data.get('asks', [])[:10],
+                'timestamp': data.get('timestamp'),
+                'best_bid': data.get('bids', [[0]])[0][0] if data.get('bids') else 0,
+                'best_ask': data.get('asks', [[0]])[0][0] if data.get('asks') else 0
+            },
             'timestamp': datetime.now().isoformat()
         }
 
-        await self._buffer_data(subscription_key, stream_data)
+        self.stream_cache[subscription_key] = cached_data
+        await self._broadcast_to_subscribers(subscription_key, cached_data)
 
-    async def _handle_klines_stream(self, exchange: str, symbol: str, timeframe: str, data: Dict[str, Any]):
-        """Handle klines stream data"""
+    async def broadcast_klines_data(self, exchange: str, symbol: str, timeframe: str, data: Dict[str, Any]):
+        """Broadcast klines data to subscribed clients"""
         subscription_key = f"klines:{exchange}:{symbol}:{timeframe}"
 
-        stream_data = {
+        # Cache data
+        self.stream_cache[subscription_key] = {
             'type': 'klines',
             'exchange': exchange,
             'symbol': symbol,
@@ -355,46 +333,42 @@ class WebSocketServer:
             'timestamp': datetime.now().isoformat()
         }
 
-        await self._buffer_data(subscription_key, stream_data)
+        await self._broadcast_to_subscribers(subscription_key, self.stream_cache[subscription_key])
 
-    async def _handle_trades_stream(self, exchange: str, symbol: str, data: Dict[str, Any]):
-        """Handle trades stream data"""
+    async def broadcast_trades_data(self, exchange: str, symbol: str, data: List[Dict[str, Any]]):
+        """Broadcast trades data to subscribed clients"""
         subscription_key = f"trades:{exchange}:{symbol}"
 
-        stream_data = {
+        # Don't cache trades (too volatile)
+        trade_data = {
             'type': 'trades',
             'exchange': exchange,
             'symbol': symbol,
-            'data': data,
+            'data': data[-10:] if len(data) > 10 else data,  # Last 10 trades only
             'timestamp': datetime.now().isoformat()
         }
 
-        await self._buffer_data(subscription_key, stream_data)
+        await self._broadcast_to_subscribers(subscription_key, trade_data)
 
-    async def _buffer_data(self, subscription_key: str, data: Dict[str, Any]):
-        """Buffer data for aggregation"""
+    async def _broadcast_to_subscribers(self, subscription_key: str, data: Dict[str, Any]):
+        """Broadcast data to all subscribers of a key"""
         if subscription_key not in self.reverse_subscriptions:
-            return  # No subscribers
+            return
 
-        # For real-time critical data, send immediately
-        if data['type'] in ['ticker', 'trades']:
-            clients = self.reverse_subscriptions[subscription_key].copy()
-            tasks = []
+        clients = self.reverse_subscriptions[subscription_key].copy()
 
-            for client_id in clients:
-                tasks.append(self._send_to_client(client_id, data))
+        # Send to all subscribed clients
+        tasks = []
+        for client_id in clients:
+            message_data = {
+                'type': 'stream_data',
+                'subscription': subscription_key,
+                **data
+            }
+            tasks.append(self._send_to_client(client_id, message_data))
 
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-        else:
-            # Buffer other data types
-            if subscription_key not in self.data_buffers:
-                self.data_buffers[subscription_key] = {
-                    'data': [],
-                    'timestamp': time.time()
-                }
-
-            self.data_buffers[subscription_key]['data'].append(data)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_server_stats(self) -> Dict[str, Any]:
         """Get WebSocket server statistics"""
@@ -404,8 +378,38 @@ class WebSocketServer:
             'unique_subscriptions': len(self.reverse_subscriptions),
             'running': self.running,
             'server_started': self.server is not None,
-            'buffered_data_count': sum(len(buf.get('data', [])) for buf in self.data_buffers.values())
+            'cached_streams': len(self.stream_cache),
+            'subscription_breakdown': self._get_subscription_breakdown()
         }
+
+    def _get_subscription_breakdown(self) -> Dict[str, int]:
+        """Get breakdown of subscriptions by type"""
+        breakdown = {}
+        for subscription_key in self.reverse_subscriptions:
+            stream_type = subscription_key.split(':')[0]
+            breakdown[stream_type] = breakdown.get(stream_type, 0) + len(self.reverse_subscriptions[subscription_key])
+        return breakdown
+
+    # Integration methods for stream processing
+    async def handle_stream_processor_data(self, exchange: str, symbol: str,
+                                           message_type: str, data: Dict[str, Any]):
+        """Handle data from stream processor"""
+        try:
+            if message_type == 'ticker':
+                await self.broadcast_ticker_data(exchange, symbol, data)
+            elif message_type == 'orderbook':
+                await self.broadcast_orderbook_data(exchange, symbol, data)
+            elif message_type == 'klines':
+                timeframe = data.get('timeframe', '1m')
+                await self.broadcast_klines_data(exchange, symbol, timeframe, data)
+            elif message_type == 'trades':
+                trades = data if isinstance(data, list) else [data]
+                await self.broadcast_trades_data(exchange, symbol, trades)
+
+        except Exception as e:
+            self.logger.error("Error handling stream processor data",
+                              exchange=exchange, symbol=symbol,
+                              message_type=message_type, error=str(e))
 
 
 # Global instance
