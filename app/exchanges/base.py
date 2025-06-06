@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Union
+from collections import defaultdict
+from typing import Dict, List, Optional, Any, Union, Callable
 from datetime import datetime
 import ccxt.async_support as ccxt
 import asyncio
@@ -212,38 +213,378 @@ class RestExchangeAdapter(ExchangeAdapter):
         )
 
 
-class WebSocketExchangeAdapter(ExchangeAdapter):
-    """Base adapter for WebSocket connections"""
+class WebSocketExchangeAdapter(ABC):
+    """Enhanced base adapter for WebSocket connections with proper lifecycle management"""
 
     def __init__(self, exchange_id: str, config: Dict[str, Any]):
-        super().__init__(exchange_id, config)
-        self.ws_connections = {}
-        self.subscriptions = {}
+        super().__init__()
+        self.exchange_id = exchange_id
+        self.config = config
+        self.logger = structlog.get_logger().bind(exchange=exchange_id)
+        self.connection_status = ConnectionStatus.DISCONNECTED
+        self.last_error: Optional[str] = None
 
-    @abstractmethod
-    async def subscribe_ticker(self, symbol: str, callback) -> bool:
-        """Subscribe to ticker updates"""
-        pass
+        # Connection management
+        self.ws_connection: Optional[Any] = None
+        self.connection_lock = asyncio.Lock()
 
-    @abstractmethod
-    async def subscribe_orderbook(self, symbol: str, callback) -> bool:
-        """Subscribe to order book updates"""
-        pass
+        # Subscription management - single connection, multiple callbacks
+        self.active_subscriptions: Dict[str, Dict[str, Any]] = {}
+        self.subscription_callbacks: Dict[str, List[Callable]] = defaultdict(list)
 
-    @abstractmethod
-    async def subscribe_klines(self, symbol: str, timeframe: str, callback) -> bool:
-        """Subscribe to kline/candlestick updates"""
-        pass
+        # Message routing
+        self.message_handlers: Dict[str, Callable] = {}
+        self.universal_callback: Optional[Callable] = None
 
-    @abstractmethod
-    async def unsubscribe(self, subscription_id: str) -> bool:
-        """Unsubscribe from data stream"""
-        pass
+        # Lifecycle management
+        self.connection_task: Optional[asyncio.Task] = None
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        self.is_shutting_down = False
 
-    async def get_subscriptions(self) -> Dict[str, Any]:
-        """Get current subscriptions"""
+    async def initialize(self, credentials: Dict[str, str], options: Dict[str, Any] = None) -> bool:
+        """Initialize WebSocket connection"""
+        async with self.connection_lock:
+            if self.connection_status == ConnectionStatus.CONNECTED:
+                return True
+
+            try:
+                self.connection_status = ConnectionStatus.CONNECTING
+                self.logger.info("Initializing WebSocket connection")
+
+                # Create single WebSocket connection
+                success = await self._create_connection()
+
+                if success:
+                    self.connection_status = ConnectionStatus.CONNECTED
+
+                    # Start connection maintenance tasks
+                    self.connection_task = asyncio.create_task(self._maintain_connection())
+                    self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+                    self.logger.info("WebSocket connection established")
+                    return True
+                else:
+                    self.connection_status = ConnectionStatus.ERROR
+                    return False
+
+            except Exception as e:
+                self.connection_status = ConnectionStatus.ERROR
+                self.last_error = str(e)
+                self.logger.error("Failed to initialize WebSocket", error=str(e))
+                return False
+
+    async def close(self) -> None:
+        """Close WebSocket connection and cleanup"""
+        self.is_shutting_down = True
+
+        async with self.connection_lock:
+            # Cancel tasks
+            for task in [self.connection_task, self.heartbeat_task]:
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            # Close WebSocket connection
+            if self.ws_connection:
+                try:
+                    await self._close_connection()
+                except Exception as e:
+                    self.logger.error("Error closing WebSocket connection", error=str(e))
+                finally:
+                    self.ws_connection = None
+
+            # Clear subscriptions
+            self.active_subscriptions.clear()
+            self.subscription_callbacks.clear()
+
+            self.connection_status = ConnectionStatus.DISCONNECTED
+            self.logger.info("WebSocket connection closed")
+
+    async def subscribe_ticker(self, symbol: str, callback: Callable) -> bool:
+        """Subscribe to ticker updates with callback multiplexing"""
+        return await self._subscribe_with_multiplexing('ticker', symbol, callback)
+
+    async def subscribe_orderbook(self, symbol: str, callback: Callable, depth: int = 20) -> bool:
+        """Subscribe to orderbook updates with callback multiplexing"""
+        return await self._subscribe_with_multiplexing('orderbook', symbol, callback, depth=depth)
+
+    async def subscribe_klines(self, symbol: str, timeframe: str, callback: Callable) -> bool:
+        """Subscribe to klines updates with callback multiplexing"""
+        return await self._subscribe_with_multiplexing('klines', symbol, callback, timeframe=timeframe)
+
+    async def _subscribe_with_multiplexing(self, stream_type: str, symbol: str,
+                                           callback: Callable, **kwargs) -> bool:
+        """Generic subscription with callback multiplexing"""
+        if self.connection_status != ConnectionStatus.CONNECTED:
+            self.logger.warning("Cannot subscribe - WebSocket not connected",
+                                stream_type=stream_type, symbol=symbol)
+            return False
+
+        # Create subscription key
+        sub_key = self._create_subscription_key(stream_type, symbol, **kwargs)
+
+        async with self.connection_lock:
+            # Add callback to multiplexer
+            self.subscription_callbacks[sub_key].append(callback)
+
+            # If this is the first callback, create the actual WebSocket subscription
+            if len(self.subscription_callbacks[sub_key]) == 1:
+                try:
+                    success = await self._create_websocket_subscription(stream_type, symbol, **kwargs)
+
+                    if success:
+                        self.active_subscriptions[sub_key] = {
+                            'stream_type': stream_type,
+                            'symbol': symbol,
+                            'created_at': datetime.now(),
+                            **kwargs
+                        }
+                        self.logger.info("WebSocket subscription created",
+                                         subscription_key=sub_key)
+                    else:
+                        # Remove callback if subscription failed
+                        self.subscription_callbacks[sub_key].remove(callback)
+                        if not self.subscription_callbacks[sub_key]:
+                            del self.subscription_callbacks[sub_key]
+                        return False
+
+                except Exception as e:
+                    self.logger.error("Failed to create WebSocket subscription",
+                                      subscription_key=sub_key, error=str(e))
+                    self.subscription_callbacks[sub_key].remove(callback)
+                    if not self.subscription_callbacks[sub_key]:
+                        del self.subscription_callbacks[sub_key]
+                    return False
+
+            self.logger.info("Callback added to subscription",
+                             subscription_key=sub_key,
+                             callback_count=len(self.subscription_callbacks[sub_key]))
+            return True
+
+    async def unsubscribe(self, subscription_id: str, callback: Callable = None) -> bool:
+        """Unsubscribe with proper callback management"""
+        async with self.connection_lock:
+            if subscription_id not in self.subscription_callbacks:
+                return True
+
+            if callback:
+                # Remove specific callback
+                if callback in self.subscription_callbacks[subscription_id]:
+                    self.subscription_callbacks[subscription_id].remove(callback)
+            else:
+                # Remove all callbacks
+                self.subscription_callbacks[subscription_id].clear()
+
+            # If no more callbacks, unsubscribe from WebSocket
+            if not self.subscription_callbacks[subscription_id]:
+                del self.subscription_callbacks[subscription_id]
+
+                if subscription_id in self.active_subscriptions:
+                    await self._remove_websocket_subscription(subscription_id)
+                    del self.active_subscriptions[subscription_id]
+
+                self.logger.info("WebSocket subscription removed",
+                                 subscription_id=subscription_id)
+            else:
+                self.logger.info("Callback removed from subscription",
+                                 subscription_id=subscription_id,
+                                 remaining_callbacks=len(self.subscription_callbacks[subscription_id]))
+
+            return True
+
+    async def _maintain_connection(self):
+        """Maintain WebSocket connection"""
+        while not self.is_shutting_down:
+            try:
+                if self.connection_status == ConnectionStatus.CONNECTED:
+                    # Check connection health
+                    if not await self._is_connection_alive():
+                        self.logger.warning("WebSocket connection lost, reconnecting")
+                        await self._reconnect()
+
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Connection maintenance error", error=str(e))
+                await asyncio.sleep(10)
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeat/ping messages"""
+        while not self.is_shutting_down:
+            try:
+                if (self.connection_status == ConnectionStatus.CONNECTED and
+                        self.ws_connection):
+                    await self._send_heartbeat()
+
+                await asyncio.sleep(20)  # Heartbeat every 20 seconds
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Heartbeat error", error=str(e))
+                await asyncio.sleep(10)
+
+    async def _reconnect(self):
+        """Reconnect WebSocket with subscription recovery"""
+        async with self.connection_lock:
+            if self.is_shutting_down:
+                return
+
+            self.connection_status = ConnectionStatus.RECONNECTING
+
+            # Store current subscriptions for recovery
+            subscriptions_to_recover = dict(self.active_subscriptions)
+
+            try:
+                # Close existing connection
+                if self.ws_connection:
+                    await self._close_connection()
+
+                # Create new connection
+                success = await self._create_connection()
+
+                if success:
+                    self.connection_status = ConnectionStatus.CONNECTED
+
+                    # Recover subscriptions
+                    await self._recover_subscriptions(subscriptions_to_recover)
+
+                    self.logger.info("WebSocket reconnected successfully",
+                                     recovered_subscriptions=len(subscriptions_to_recover))
+                else:
+                    self.connection_status = ConnectionStatus.ERROR
+                    self.logger.error("Failed to reconnect WebSocket")
+
+            except Exception as e:
+                self.connection_status = ConnectionStatus.ERROR
+                self.last_error = str(e)
+                self.logger.error("Reconnection failed", error=str(e))
+
+    async def _recover_subscriptions(self, subscriptions: Dict[str, Dict[str, Any]]):
+        """Recover subscriptions after reconnection"""
+        for sub_key, sub_info in subscriptions.items():
+            try:
+                success = await self._create_websocket_subscription(
+                    sub_info['stream_type'],
+                    sub_info['symbol'],
+                    **{k: v for k, v in sub_info.items()
+                       if k not in ['stream_type', 'symbol', 'created_at']}
+                )
+
+                if not success:
+                    self.logger.error("Failed to recover subscription", subscription_key=sub_key)
+
+            except Exception as e:
+                self.logger.error("Error recovering subscription",
+                                  subscription_key=sub_key, error=str(e))
+
+    def _create_subscription_key(self, stream_type: str, symbol: str, **kwargs) -> str:
+        """Create unique subscription key"""
+        key_parts = [stream_type, symbol]
+
+        # Add relevant parameters to key
+        if 'timeframe' in kwargs:
+            key_parts.append(kwargs['timeframe'])
+        if 'depth' in kwargs:
+            key_parts.append(str(kwargs['depth']))
+
+        return ':'.join(key_parts)
+
+    async def _dispatch_message_to_callbacks(self, subscription_key: str, data: Dict[str, Any]):
+        """Dispatch message to all callbacks for subscription"""
+        if subscription_key not in self.subscription_callbacks:
+            return
+
+        # Dispatch to all callbacks
+        callbacks = list(self.subscription_callbacks[subscription_key])  # Copy to avoid race conditions
+
+        tasks = []
+        for callback in callbacks:
+            tasks.append(self._safe_callback_execution(callback, data))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _safe_callback_execution(self, callback: Callable, data: Dict[str, Any]):
+        """Safely execute callback"""
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(data)
+            else:
+                callback(data)
+        except Exception as e:
+            self.logger.error("Callback execution failed", error=str(e))
+
+    def get_subscriptions(self) -> Dict[str, Any]:
+        """Get current subscriptions info"""
         return {
-            "total_subscriptions": len(self.subscriptions),
-            "active_connections": len(self.ws_connections),
-            "subscriptions": list(self.subscriptions.keys())
+            "total_subscriptions": len(self.active_subscriptions),
+            "subscription_details": {
+                sub_key: {
+                    **sub_info,
+                    "callback_count": len(self.subscription_callbacks.get(sub_key, []))
+                }
+                for sub_key, sub_info in self.active_subscriptions.items()
+            },
+            "connection_status": self.connection_status.value
+        }
+
+    # Abstract methods that need to be implemented by specific exchanges
+    @abstractmethod
+    async def _create_connection(self) -> bool:
+        """Create WebSocket connection"""
+        pass
+
+    @abstractmethod
+    async def _close_connection(self):
+        """Close WebSocket connection"""
+        pass
+
+    @abstractmethod
+    async def _create_websocket_subscription(self, stream_type: str, symbol: str, **kwargs) -> bool:
+        """Create actual WebSocket subscription"""
+        pass
+
+    @abstractmethod
+    async def _remove_websocket_subscription(self, subscription_key: str) -> bool:
+        """Remove WebSocket subscription"""
+        pass
+
+    @abstractmethod
+    async def _is_connection_alive(self) -> bool:
+        """Check if WebSocket connection is alive"""
+        pass
+
+    @abstractmethod
+    async def _send_heartbeat(self):
+        """Send heartbeat/ping message"""
+        pass
+
+    # Default implementations
+    async def verify_credentials(self) -> bool:
+        """WebSocket doesn't require credential verification for public streams"""
+        return True
+
+    async def get_markets(self) -> Dict[str, Any]:
+        """Get markets info (not applicable for WebSocket)"""
+        return {}
+
+    async def get_timeframes(self) -> List[str]:
+        """Get supported timeframes - override in specific adapters"""
+        return ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+
+    async def get_connection_status(self) -> Dict[str, Any]:
+        """Get current connection status and statistics"""
+        return {
+            "exchange_id": self.exchange_id,
+            "status": self.connection_status.value,
+            "last_error": self.last_error,
+            "active_subscriptions": len(self.active_subscriptions),
+            "total_callbacks": sum(len(callbacks) for callbacks in self.subscription_callbacks.values()),
+            "connection_alive": await self._is_connection_alive() if self.ws_connection else False
         }

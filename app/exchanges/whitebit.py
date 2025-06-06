@@ -1,3 +1,4 @@
+from abc import ABC
 from typing import Dict, List, Optional, Any, Callable
 import json
 import asyncio
@@ -79,8 +80,8 @@ class WhiteBitRestAdapter(RestExchangeAdapter):
             return {}
 
 
-class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter):
-    """WhiteBit WebSocket API adapter"""
+class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter, ABC):
+    """Enhanced WhiteBit WebSocket adapter with centralized connection management"""
 
     def __init__(self):
         super().__init__('whitebit', {
@@ -89,92 +90,173 @@ class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter):
         })
         self.request_id = 1
 
-    async def initialize(self, credentials: Dict[str, str], options: Dict[str, Any] = None) -> bool:
-        """Initialize WebSocket connection"""
+    async def _create_connection(self) -> bool:
+        """Create single WebSocket connection for all subscriptions"""
         try:
-            self.connection_status = ConnectionStatus.CONNECTING
-            self.logger.info("Initializing WhiteBit WebSocket connection")
-            self.connection_status = ConnectionStatus.CONNECTED
+            url = self.config['ws_public_url']
+
+            self.ws_connection = await websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=10
+            )
+
+            # Start message listening task
+            asyncio.create_task(self._listen_to_messages())
+
             return True
+
         except Exception as e:
-            self.connection_status = ConnectionStatus.ERROR
-            self.last_error = str(e)
-            self.logger.error("Failed to initialize WebSocket", error=str(e))
+            self.logger.error("Failed to create WhiteBit WebSocket connection", error=str(e))
             return False
 
-    async def close(self) -> None:
-        """Close WebSocket connections"""
-        for connection in self.ws_connections.values():
-            if connection and not connection.closed:
-                await connection.close()
+    async def _create_websocket_subscription(self, stream_type: str, symbol: str, **kwargs) -> bool:
+        """Create WebSocket subscription using WhiteBit's subscribe method"""
+        try:
+            if not self.ws_connection:
+                return False
 
-        self.ws_connections.clear()
-        self.subscriptions.clear()
-        self.connection_status = ConnectionStatus.DISCONNECTED
-        self.logger.info("WebSocket connections closed")
+            # Build subscription parameters
+            method, params = self._build_subscription_params(stream_type, symbol, **kwargs)
 
-    async def verify_credentials(self) -> bool:
-        """WebSocket doesn't require credential verification for public streams"""
-        return True
+            # Send subscription message
+            subscribe_message = {
+                "id": self.request_id,
+                "method": method,
+                "params": params
+            }
 
-    async def get_markets(self) -> Dict[str, Any]:
-        """Get markets info (not applicable for WebSocket)"""
-        return {}
+            await self.ws_connection.send(json.dumps(subscribe_message))
+            self.request_id += 1
 
-    async def get_timeframes(self) -> List[str]:
-        """Get supported timeframes"""
-        return ['1m', '5m', '15m', '30m', '1h', '4h', '12h', '1d', '1w']
+            self.logger.info("Subscribed to WhiteBit stream",
+                             method=method, symbol=symbol)
 
-    async def _create_connection(self) -> websockets.WebSocketServerProtocol:
-        """Create WebSocket connection"""
-        connection = await websockets.connect(self.config['ws_public_url'])
-        return connection
+            return True
 
-    async def _send_subscription(self, connection: websockets.WebSocketServerProtocol, method: str, params: List[str]):
-        """Send subscription message"""
-        message = {
-            "id": self.request_id,
-            "method": method,
-            "params": params
-        }
-        self.request_id += 1
+        except Exception as e:
+            self.logger.error("Failed to create WhiteBit subscription",
+                              stream_type=stream_type, symbol=symbol, error=str(e))
+            return False
 
-        await connection.send(json.dumps(message))
+    def _build_subscription_params(self, stream_type: str, symbol: str, **kwargs):
+        """Build WhiteBit subscription method and parameters"""
+        if stream_type == 'ticker':
+            return "ticker_subscribe", [symbol]
+        elif stream_type == 'orderbook':
+            limit = kwargs.get('depth', 100)
+            interval = kwargs.get('interval', "0")
+            return "depth_subscribe", [symbol, limit, interval]
+        elif stream_type == 'klines':
+            timeframe = kwargs.get('timeframe', '1m')
+            return "candles_subscribe", [symbol, timeframe]
+        elif stream_type == 'trades':
+            return "trades_subscribe", [symbol]
+        else:
+            return "ticker_subscribe", [symbol]  # Default
 
-    async def _handle_message(self, message: str, callback: Callable):
+    async def _listen_to_messages(self):
+        """Listen to WebSocket messages and dispatch to callbacks"""
+        try:
+            async for message in self.ws_connection:
+                await self._handle_message(message)
+
+        except websockets.exceptions.ConnectionClosed:
+            if not self.is_shutting_down:
+                self.logger.warning("WhiteBit WebSocket connection closed")
+                self.connection_status = ConnectionStatus.ERROR
+        except Exception as e:
+            if not self.is_shutting_down:
+                self.logger.error("Error in WhiteBit WebSocket listener", error=str(e))
+                self.connection_status = ConnectionStatus.ERROR
+
+    async def _handle_message(self, message: str):
+        """Handle incoming WhiteBit WebSocket message"""
         try:
             data = json.loads(message)
 
-            if not isinstance(data, dict):
+            # Skip subscription confirmation messages
+            if 'id' in data and 'result' in data:
                 return
 
-            if 'id' in data and data.get('result') is not None:
-                self.logger.info("Subscription response", data=data)
-                return
-
+            # Handle stream data
             if 'method' in data and 'params' in data:
-                normalized_data = self._normalize_message(data)
-                if normalized_data:
-                    await callback(normalized_data)
+                method = data['method']
+                params = data['params']
+
+                # Parse method to get subscription key
+                subscription_key = self._parse_method(method, params)
+
+                if subscription_key:
+                    # Normalize message data
+                    normalized_data = self._normalize_message(method, params)
+
+                    if normalized_data:
+                        # Dispatch to callbacks
+                        await self._dispatch_message_to_callbacks(subscription_key, normalized_data)
+
         except Exception as e:
-            self.logger.error("Failed to handle WebSocket message", error=str(e))
+            self.logger.error("Failed to handle WhiteBit message",
+                              message=message[:100], error=str(e))
 
-    def _normalize_message(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _parse_method(self, method: str, params: List[Any]) -> Optional[str]:
+        """Parse WhiteBit method to subscription key"""
+        try:
+            if not params:
+                return None
+
+            symbol = params[0] if len(params) > 0 else ""
+
+            if method == 'ticker_update':
+                return f"ticker:{symbol}"
+            elif method == 'depth_update':
+                return f"orderbook:{symbol}"
+            elif method == 'candles_update':
+                return f"klines:{symbol}"
+            elif method == 'trades_update':
+                return f"trades:{symbol}"
+
+            return None
+
+        except Exception:
+            return None
+
+    async def _is_connection_alive(self) -> bool:
+        """Check if WebSocket connection is alive"""
+        return self.ws_connection and not self.ws_connection.closed
+
+    async def _send_heartbeat(self):
+        """Send ping to maintain connection"""
+        try:
+            if self.ws_connection and not self.ws_connection.closed:
+                ping_message = {"id": self.request_id, "method": "ping", "params": []}
+                await self.ws_connection.send(json.dumps(ping_message))
+                self.request_id += 1
+        except Exception as e:
+            self.logger.error("Failed to send WhiteBit heartbeat", error=str(e))
+
+    # Add normalization methods similar to Binance/Bybit for WhiteBit
+    def _normalize_message(self, method: str, params: List[Any]) -> Optional[Dict[str, Any]]:
         """Normalize WhiteBit WebSocket message to standard format"""
-        method = data.get('method', '')
-        params = data.get('params', [])
+        try:
+            if method == 'ticker_update':
+                return self._normalize_ticker(params)
+            elif method == 'depth_update':
+                return self._normalize_orderbook(params)
+            elif method == 'candles_update':
+                return self._normalize_kline(params)
+            elif method == 'trades_update':
+                return self._normalize_trade(params)
 
-        if method == 'ticker_update':
-            return self._normalize_ticker(params)
-        elif method == 'depth_update':
-            return self._normalize_orderbook(params)
-        elif method == 'candles_update':
-            return self._normalize_kline(params)
+            return None
 
-        return None
+        except Exception as e:
+            self.logger.error("Failed to normalize WhiteBit message", error=str(e))
+            return None
 
-    def _normalize_ticker(self, params: List[Any]) -> Dict[str, Any]:
-        """Normalize ticker data"""
+    def _normalize_ticker(self, params: List[Any]) -> Optional[Dict[str, Any]]:
+        """Normalize WhiteBit ticker data"""
         if len(params) < 2:
             return None
 
@@ -202,8 +284,8 @@ class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter):
             }
         }
 
-    def _normalize_orderbook(self, params: List[Any]) -> Dict[str, Any]:
-        """Normalize order book data"""
+    def _normalize_orderbook(self, params: List[Any]) -> Optional[Dict[str, Any]]:
+        """Normalize WhiteBit order book data"""
         if len(params) < 3:
             return None
 
@@ -221,12 +303,13 @@ class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter):
                 'datetime': datetime.now().isoformat(),
                 'bids': [[float(bid[0]), float(bid[1])] for bid in orderbook_data.get('bids', [])],
                 'asks': [[float(ask[0]), float(ask[1])] for ask in orderbook_data.get('asks', [])],
-                'is_full_update': is_full
+                'is_full_update': is_full,
+                'nonce': orderbook_data.get('id', 0)
             }
         }
 
-    def _normalize_kline(self, params: List[Any]) -> Dict[str, Any]:
-        """Normalize kline data"""
+    def _normalize_kline(self, params: List[Any]) -> Optional[Dict[str, Any]]:
+        """Normalize WhiteBit kline data"""
         if len(params) < 3:
             return None
 
@@ -234,169 +317,104 @@ class WhiteBitWebSocketAdapter(WebSocketExchangeAdapter):
         interval = params[1]
         kline_data = params[2]
 
+        # Handle both single kline and array format
+        if isinstance(kline_data, list) and len(kline_data) > 0:
+            kline = kline_data[0] if isinstance(kline_data[0], dict) else {
+                't': kline_data[0],  # timestamp
+                'o': kline_data[1],  # open
+                'h': kline_data[2],  # high
+                'l': kline_data[3],  # low
+                'c': kline_data[4],  # close
+                'v': kline_data[5]  # volume
+            }
+        else:
+            kline = kline_data
+
         return {
-            'type': 'kline',
+            'type': 'klines',
             'exchange': 'whitebit',
             'symbol': symbol,
             'timeframe': interval,
             'data': {
-                'timestamp': int(kline_data.get('t', 0)) * 1000,
-                'datetime': datetime.fromtimestamp(int(kline_data.get('t', 0))).isoformat(),
-                'open': float(kline_data.get('o', 0)),
-                'high': float(kline_data.get('h', 0)),
-                'low': float(kline_data.get('l', 0)),
-                'close': float(kline_data.get('c', 0)),
-                'volume': float(kline_data.get('v', 0)),
-                'is_closed': True
+                'timestamp': int(kline.get('t', 0)) * 1000,  # Convert to milliseconds
+                'datetime': datetime.fromtimestamp(int(kline.get('t', 0))).isoformat(),
+                'open': float(kline.get('o', 0)),
+                'high': float(kline.get('h', 0)),
+                'low': float(kline.get('l', 0)),
+                'close': float(kline.get('c', 0)),
+                'volume': float(kline.get('v', 0)),
+                'is_closed': True  # WhiteBit usually sends completed candles
             }
         }
 
-    async def subscribe_ticker(self, symbol: str, callback: Callable) -> bool:
-        """Subscribe to ticker updates"""
-        try:
-            subscription_id = f"ticker_{symbol}"
-            connection = await self._create_connection()
+    def _normalize_trade(self, params: List[Any]) -> Optional[Dict[str, Any]]:
+        """Normalize WhiteBit trade data"""
+        if len(params) < 2:
+            return None
 
-            self.ws_connections[subscription_id] = connection
-            self.subscriptions[subscription_id] = {
-                'type': 'ticker',
-                'symbol': symbol,
-                'method': 'ticker_subscribe',
-                'callback': callback
-            }
+        symbol = params[0]
+        trades_data = params[1]
 
-            await self._send_subscription(connection, 'ticker_subscribe', [symbol])
-            asyncio.create_task(self._listen_to_stream(connection, callback))
+        # Handle both single trade and array format
+        trades = trades_data if isinstance(trades_data, list) else [trades_data]
 
-            self.logger.info("Subscribed to ticker", symbol=symbol)
-            return True
+        normalized_trades = []
+        for trade in trades:
+            if isinstance(trade, dict):
+                normalized_trades.append({
+                    'id': trade.get('id', ''),
+                    'timestamp': int(trade.get('time', 0)) * 1000,
+                    'datetime': datetime.fromtimestamp(int(trade.get('time', 0))).isoformat(),
+                    'symbol': symbol,
+                    'price': float(trade.get('price', 0)),
+                    'amount': float(trade.get('amount', 0)),
+                    'side': trade.get('type', 'unknown').lower()  # 'buy' or 'sell'
+                })
+            elif isinstance(trade, list) and len(trade) >= 5:
+                # Array format: [id, timestamp, price, amount, side]
+                normalized_trades.append({
+                    'id': str(trade[0]),
+                    'timestamp': int(trade[1]) * 1000,
+                    'datetime': datetime.fromtimestamp(int(trade[1])).isoformat(),
+                    'symbol': symbol,
+                    'price': float(trade[2]),
+                    'amount': float(trade[3]),
+                    'side': 'buy' if trade[4] else 'sell'  # True = buy, False = sell
+                })
 
-        except Exception as e:
-            self.logger.error("Failed to subscribe to ticker", symbol=symbol, error=str(e))
-            return False
+        return {
+            'type': 'trades',
+            'exchange': 'whitebit',
+            'symbol': symbol,
+            'data': normalized_trades if len(normalized_trades) > 1 else normalized_trades[
+                0] if normalized_trades else {}
+        }
 
-    async def subscribe_orderbook(self, symbol: str, callback: Callable, limit: int = 100, interval: str = "0") -> bool:
-        """Subscribe to order book updates"""
-        try:
-            subscription_id = f"orderbook_{symbol}_{limit}"
-            connection = await self._create_connection()
-
-            self.ws_connections[subscription_id] = connection
-            self.subscriptions[subscription_id] = {
-                'type': 'orderbook',
-                'symbol': symbol,
-                'method': 'depth_subscribe',
-                'callback': callback
-            }
-
-            await self._send_subscription(connection, 'depth_subscribe', [symbol, limit, interval])
-            asyncio.create_task(self._listen_to_stream(connection, callback))
-
-            self.logger.info("Subscribed to orderbook", symbol=symbol, limit=limit)
-            return True
-
-        except Exception as e:
-            self.logger.error("Failed to subscribe to orderbook", symbol=symbol, error=str(e))
-            return False
-
-    async def subscribe_klines(self, symbol: str, timeframe: str, callback: Callable) -> bool:
-        """Subscribe to kline/candlestick updates"""
-        try:
-            subscription_id = f"klines_{symbol}_{timeframe}"
-            connection = await self._create_connection()
-
-            self.ws_connections[subscription_id] = connection
-            self.subscriptions[subscription_id] = {
-                'type': 'klines',
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'method': 'candles_subscribe',
-                'callback': callback
-            }
-
-            await self._send_subscription(connection, 'candles_subscribe', [symbol, timeframe])
-            asyncio.create_task(self._listen_to_stream(connection, callback))
-
-            self.logger.info("Subscribed to klines", symbol=symbol, timeframe=timeframe)
-            return True
-
-        except Exception as e:
-            self.logger.error("Failed to subscribe to klines", symbol=symbol, timeframe=timeframe, error=str(e))
-            return False
-
-    async def unsubscribe(self, subscription_id: str) -> bool:
-        """Unsubscribe from data stream"""
-        try:
-            if subscription_id in self.subscriptions:
-                subscription = self.subscriptions[subscription_id]
-                connection = self.ws_connections.get(subscription_id)
-
-                if connection and not connection.closed:
-                    unsubscribe_method = subscription.get('method', '').replace('_subscribe', '_unsubscribe')
-                    symbol = subscription.get('symbol')
-
-                    if unsubscribe_method and symbol:
-                        await self._send_subscription(connection, unsubscribe_method, [symbol])
-
-                    await connection.close()
-
-                del self.ws_connections[subscription_id]
-                del self.subscriptions[subscription_id]
-
-            self.logger.info("Unsubscribed from stream", subscription_id=subscription_id)
-            return True
-
-        except Exception as e:
-            self.logger.error("Failed to unsubscribe", subscription_id=subscription_id, error=str(e))
-            return False
-
-    async def _listen_to_stream(self, connection: websockets.WebSocketServerProtocol, callback: Callable):
-        """Listen to WebSocket stream"""
-        try:
-            async for message in connection:
-                await self._handle_message(message, callback)
-        except websockets.exceptions.ConnectionClosed:
-            self.logger.warning("WebSocket connection closed")
-        except Exception as e:
-            self.logger.error("Error in WebSocket stream", error=str(e))
+    async def get_timeframes(self) -> List[str]:
+        """Get supported timeframes for WhiteBit"""
+        return ['1m', '5m', '15m', '30m', '1h', '4h', '12h', '1d', '1w']
 
 
 class WhiteBitAdapter:
-    """Combined WhiteBit adapter with REST and WebSocket capabilities"""
+    """Enhanced WhiteBit adapter with centralized WebSocket"""
 
     def __init__(self):
         self.rest = WhiteBitRestAdapter()
         self.websocket = WhiteBitWebSocketAdapter()
         self.logger = self.rest.logger
+        self._universal_callback = None
 
     async def initialize(self, credentials: Dict[str, str], options: Dict[str, Any] = None) -> bool:
-        """Initialize both REST and WebSocket connections"""
         rest_success = await self.rest.initialize(credentials, options)
         ws_success = await self.websocket.initialize(credentials, options)
-
         return rest_success and ws_success
 
     async def close(self) -> None:
-        """Close both REST and WebSocket connections"""
         try:
             if self.rest:
                 await self.rest.close()
             if self.websocket:
                 await self.websocket.close()
-
-            self.logger.info("Adapter closed successfully")
+            self.logger.info("WhiteBit adapter closed successfully")
         except Exception as e:
-            self.logger.error("Error closing adapter", error=str(e))
-
-    async def get_connection_status(self) -> Dict[str, Any]:
-        """Get combined connection status"""
-        rest_status = await self.rest.get_connection_status()
-        ws_status = await self.websocket.get_connection_status()
-        ws_subscriptions = await self.websocket.get_subscriptions()
-
-        return {
-            'exchange_id': 'whitebit',
-            'rest': rest_status,
-            'websocket': ws_status,
-            'subscriptions': ws_subscriptions
-        }
+            self.logger.error("Error closing WhiteBit adapter", error=str(e))

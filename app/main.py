@@ -1,4 +1,8 @@
 import asyncio
+from collections import defaultdict
+from datetime import datetime
+from typing import Dict, Any, List
+
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,14 +48,14 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
-        """Initialize all systems with new stream processing architecture"""
+        """Initialize all systems with new centralized WebSocket architecture"""
         logger = structlog.get_logger()
-        logger.info("Starting High-Performance Crypto Data Microservice v3.0")
+        logger.info("🚀 Starting High-Performance Crypto Data Microservice v3.0")
 
         try:
             # 1. Initialize monitoring system first
             await monitoring_system.initialize()
-            logger.info("Monitoring system initialized")
+            logger.info("✅ Monitoring system initialized")
 
             # 2. Initialize database migrations and optimizer
             from .models.migrations import migrator
@@ -61,11 +65,11 @@ def create_app() -> FastAPI:
 
             # Initialize database optimizer
             await database_optimizer.initialize()
-            logger.info("Database optimizer initialized")
+            logger.info("✅ Database optimizer initialized")
 
-            # 3. Initialize exchange manager
+            # 3. Initialize exchange manager with centralized WebSocket management
             await exchange_manager.initialize()
-            logger.info("Exchange manager initialized")
+            logger.info("✅ Exchange manager initialized")
 
             # 4. Create and initialize stream processor
             stream_config = StreamProcessorConfig({
@@ -86,57 +90,185 @@ def create_app() -> FastAPI:
 
             app.state.stream_processor = StreamProcessor(stream_config.__dict__)
             await app.state.stream_processor.initialize()
-            logger.info("Stream processor initialized")
+            logger.info("✅ Stream processor initialized")
 
-            # 5. Start WebSocket integrations
+            # 5. Start WebSocket server
             from .services.websocket_server import websocket_server
             asyncio.create_task(websocket_server.start_server(port=settings.websocket_port))
-            logger.info("WebSocket server started")
+            logger.info("✅ WebSocket server started on port", port=settings.websocket_port)
 
-            # 6. Setup data flows
+            # 6. Setup centralized data flows with bulk subscriptions
             await setup_data_flows(app.state.stream_processor)
-            logger.info("Data flows configured")
+            logger.info("✅ Data flows configured")
 
-            logger.info("High-Performance Crypto Data Microservice startup complete")
+            # 7. Start background monitoring and health checks
+            asyncio.create_task(start_health_monitoring())
+            logger.info("✅ Health monitoring started")
+
+            # 8. Log final statistics
+            await log_startup_statistics()
+
+            logger.info("🎉 High-Performance Crypto Data Microservice startup complete!")
 
         except Exception as e:
-            logger.error("Failed to initialize application", error=str(e))
+            logger.error("💥 Failed to initialize application", error=str(e))
             raise
+
+    async def start_health_monitoring():
+        """Start background health monitoring tasks"""
+        logger = structlog.get_logger()
+
+        async def health_monitor_loop():
+            """Continuous health monitoring"""
+            while True:
+                try:
+                    # Check subscription health every 2 minutes
+                    health = await get_subscription_health_status()
+
+                    if health['overall_health'] != 'healthy':
+                        logger.warning("Subscription health issues detected",
+                                       overall_health=health['overall_health'],
+                                       issues=health['issues'])
+
+                        # Auto-recovery for critical issues
+                        if health['overall_health'] == 'unhealthy':
+                            logger.info("Attempting automatic recovery...")
+                            await attempt_recovery()
+
+                    # Log stats every 10 minutes
+                    stats = await exchange_manager.get_subscription_stats()
+                    logger.info("📊 Subscription statistics",
+                                total_subscriptions=stats['total_subscriptions'],
+                                exchanges={ex: info['count']
+                                           for ex, info in stats['by_exchange'].items()})
+
+                    await asyncio.sleep(120)  # Check every 2 minutes
+
+                except Exception as e:
+                    logger.error("Health monitoring error", error=str(e))
+                    await asyncio.sleep(300)  # Wait 5 minutes on error
+
+        # Start monitoring task
+        asyncio.create_task(health_monitor_loop())
+
+    async def attempt_recovery():
+        """Attempt to recover unhealthy connections"""
+        logger = structlog.get_logger()
+
+        try:
+            # Get current health status
+            health = await get_subscription_health_status()
+
+            for exchange, info in health['exchanges'].items():
+                if info['status'] == 'unhealthy':
+                    logger.info("🔄 Attempting recovery for exchange", exchange=exchange)
+
+                    # Try to reinitialize the exchange adapter
+                    adapter = await exchange_manager.get_public_adapter(exchange)
+                    if adapter:
+                        # Force reconnection
+                        await adapter.websocket._reconnect()
+                        logger.info("✅ Recovery attempted for exchange", exchange=exchange)
+
+            # Wait a bit and check again
+            await asyncio.sleep(30)
+
+            post_recovery_health = await get_subscription_health_status()
+            logger.info("Recovery results",
+                        pre_recovery=health['overall_health'],
+                        post_recovery=post_recovery_health['overall_health'])
+
+        except Exception as e:
+            logger.error("Recovery attempt failed", error=str(e))
+
+    async def log_startup_statistics():
+        """Log comprehensive startup statistics"""
+        logger = structlog.get_logger()
+
+        try:
+            # Subscription statistics
+            sub_stats = await exchange_manager.get_subscription_stats()
+
+            # System health
+            health = await get_subscription_health_status()
+
+            # Stream processor stats
+            stream_stats = app.state.stream_processor.get_stats() if hasattr(app.state, 'stream_processor') else {}
+
+            startup_stats = {
+                "🔗 WebSocket Subscriptions": {
+                    "Total": sub_stats['total_subscriptions'],
+                    "By Exchange": {ex: info['count'] for ex, info in sub_stats['by_exchange'].items()},
+                    "Health": health['overall_health']
+                },
+                "⚡ Stream Processor": {
+                    "Performance Mode": stream_stats.get('performance_mode', 'unknown'),
+                    "Components Running": len([comp for comp, stats in stream_stats.items()
+                                               if isinstance(stats, dict) and stats.get('running', False)])
+                },
+                "🌐 WebSocket Connections": {
+                    exchange: conn_info['connected']
+                    for exchange, conn_info in sub_stats.get('websocket_connections', {}).items()
+                }
+            }
+
+            logger.info("📈 Startup Statistics", **startup_stats)
+
+            # Performance recommendations
+            recommendations = monitoring_system.get_performance_recommendations()
+            if recommendations:
+                logger.info("💡 Performance Recommendations",
+                            recommendations=[r['title'] for r in recommendations[:3]])
+
+        except Exception as e:
+            logger.error("Failed to log startup statistics", error=str(e))
 
     @app.on_event("shutdown")
     async def shutdown_event():
-        """Graceful shutdown with stream processing cleanup"""
+        """Enhanced graceful shutdown with proper WebSocket cleanup"""
         logger = structlog.get_logger()
-        logger.info("Shutting down High-Performance Crypto Data Microservice")
+        logger.info("🛑 Shutting down High-Performance Crypto Data Microservice")
 
         try:
-            # 1. Stop stream processor
+            # 1. Stop accepting new subscriptions
+            logger.info("🔒 Stopping new subscriptions...")
+
+            # 2. Gracefully close all WebSocket subscriptions
+            logger.info("📡 Closing WebSocket subscriptions...")
+            sub_stats = await exchange_manager.get_subscription_stats()
+            total_subs = sub_stats['total_subscriptions']
+
+            # 3. Stop stream processor
             if hasattr(app.state, 'stream_processor'):
+                logger.info("⚙️ Stopping stream processor...")
                 await app.state.stream_processor.shutdown()
-                logger.info("Stream processor shutdown complete")
+                logger.info("✅ Stream processor shutdown complete")
 
-            # 2. Stop WebSocket server
+            # 4. Stop WebSocket server
             from .services.websocket_server import websocket_server
+            logger.info("🌐 Stopping WebSocket server...")
             await websocket_server.stop_server()
-            logger.info("WebSocket server stopped")
+            logger.info("✅ WebSocket server stopped")
 
-            # 3. Shutdown exchange manager
+            # 5. Shutdown exchange manager (closes all WebSocket connections)
+            logger.info("🔌 Shutting down exchange manager...")
             await exchange_manager.shutdown()
-            logger.info("Exchange manager shutdown")
+            logger.info(f"✅ Exchange manager shutdown ({total_subs} subscriptions closed)")
 
-            # 4. Shutdown monitoring
+            # 6. Shutdown monitoring
+            logger.info("📊 Stopping monitoring...")
             await monitoring_system.shutdown()
-            logger.info("Monitoring system shutdown")
+            logger.info("✅ Monitoring system shutdown")
 
-            # 5. Close database connections
+            # 7. Close database connections
             from .models.migrations import migrator
             await migrator.close()
-            logger.info("Database connections closed")
+            logger.info("✅ Database connections closed")
+
+            logger.info("🎯 Application shutdown complete - All connections properly closed")
 
         except Exception as e:
-            logger.error("Error during shutdown", error=str(e))
-
-        logger.info("Application shutdown complete")
+            logger.error("❌ Error during shutdown", error=str(e))
 
     @app.get("/")
     async def root():
@@ -178,35 +310,115 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="Failed to get system status")
 
     @app.get("/health")
-    async def health_check():
-        """Comprehensive health check"""
+    async def enhanced_health_check():
+        """Enhanced health check with WebSocket subscription status"""
         try:
-            if not hasattr(app.state, 'stream_processor'):
-                return {"status": "unhealthy", "error": "Stream processor not initialized"}
+            health_data = {
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'components': {},
+                'websockets': {},
+                'subscriptions': {}
+            }
 
-            # Get comprehensive health from stream processor
-            health_data = await app.state.stream_processor.health_check()
+            # Stream processor health
+            if hasattr(app.state, 'stream_processor'):
+                stream_health = await app.state.stream_processor.health_check()
+                health_data['components']['stream_processor'] = stream_health
+            else:
+                health_data['components']['stream_processor'] = {
+                    'healthy': False,
+                    'status': 'not_initialized'
+                }
 
-            # Add exchange status
+            # Exchange manager health
             exchange_status = await exchange_manager.get_all_exchanges_status()
             health_data['components']['exchanges'] = {
                 'healthy': exchange_status.get('total_exchanges', 0) > 0,
                 'details': exchange_status
             }
 
-            # Add monitoring status
+            # WebSocket subscription health
+            subscription_health = await get_subscription_health_status()
+            health_data['websockets'] = subscription_health['websocket_connections']
+            health_data['subscriptions'] = {
+                'total': subscription_health['total_subscriptions'],
+                'health': subscription_health['overall_health'],
+                'by_exchange': subscription_health['exchanges']
+            }
+
+            # Monitoring status
             monitoring_status = monitoring_system.get_comprehensive_status()
             health_data['components']['monitoring'] = {
                 'healthy': monitoring_status.get('health_score', 0) > 50,
                 'details': monitoring_status
             }
 
+            # Determine overall health
+            component_health = [
+                health_data['components']['stream_processor'].get('healthy', False),
+                health_data['components']['exchanges']['healthy'],
+                health_data['components']['monitoring']['healthy'],
+                subscription_health['overall_health'] in ['healthy', 'degraded']
+            ]
+
+            if all(component_health):
+                health_data['status'] = 'healthy'
+            elif sum(component_health) >= len(component_health) * 0.75:
+                health_data['status'] = 'degraded'
+            else:
+                health_data['status'] = 'unhealthy'
+
             return health_data
 
         except Exception as e:
             logger = structlog.get_logger()
-            logger.error("Health check failed", error=str(e))
-            raise HTTPException(status_code=500, detail="Health check failed")
+            logger.error("Enhanced health check failed", error=str(e))
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+
+    @app.get("/api/v1/subscriptions/stats")
+    async def get_subscription_statistics():
+        """Get detailed WebSocket subscription statistics"""
+        try:
+            stats = await exchange_manager.get_subscription_stats()
+            health = await get_subscription_health_status()
+
+            return {
+                "status": "success",
+                "data": {
+                    "statistics": stats,
+                    "health": health,
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Failed to get subscription stats", error=str(e))
+            raise HTTPException(status_code=500, detail="Failed to get subscription statistics")
+
+    @app.post("/api/v1/subscriptions/recover")
+    async def trigger_subscription_recovery():
+        """Manually trigger subscription recovery"""
+        try:
+            await attempt_recovery()
+
+            # Get post-recovery status
+            health = await get_subscription_health_status()
+
+            return {
+                "status": "success",
+                "message": "Recovery attempted",
+                "health_status": health['overall_health'],
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger = structlog.get_logger()
+            logger.error("Manual recovery failed", error=str(e))
+            raise HTTPException(status_code=500, detail="Recovery attempt failed")
 
     @app.get("/metrics")
     async def get_comprehensive_metrics():
@@ -310,7 +522,7 @@ def create_app() -> FastAPI:
 
 
 async def setup_data_flows(stream_processor: StreamProcessor):
-    """Setup data flows between components"""
+    """Setup data flows between components with centralized WebSocket management"""
     logger = structlog.get_logger()
 
     try:
@@ -322,12 +534,17 @@ async def setup_data_flows(stream_processor: StreamProcessor):
                 active_pairs = await TradingPair.get_active_pairs(session)
                 logger.info("Loaded active trading pairs", count=len(active_pairs))
 
+                # Group trading pairs by exchange for efficient bulk subscription
+                pairs_by_exchange = defaultdict(list)
                 for pair in active_pairs:
                     exchange_slug = pair['exchange_slug']
-                    symbol = pair['symbol']
+                    pairs_by_exchange[exchange_slug].append(pair)
 
-                    await setup_exchange_subscriptions(exchange_slug, symbol)
+                # Setup bulk subscriptions per exchange
+                for exchange_slug, pairs in pairs_by_exchange.items():
+                    await setup_exchange_bulk_subscriptions(exchange_slug, pairs, stream_processor)
 
+        # Setup WebSocket integration with stream processor
         await setup_websocket_integration(stream_processor)
         logger.info("Data flows setup complete")
 
@@ -335,62 +552,260 @@ async def setup_data_flows(stream_processor: StreamProcessor):
         logger.error("Failed to setup data flows", error=str(e))
         raise
 
-async def setup_websocket_integration(stream_processor: StreamProcessor):
-    """Setup WebSocket message routing to stream processor"""
 
-    # This function will be called by WebSocket handlers to route messages
-    async def route_websocket_message(exchange: str, symbol: str, message_type: str, data: dict):
-        """Route WebSocket message to stream processor"""
-        try:
-            await stream_processor.process_message(exchange, symbol, message_type, data)
-        except Exception as e:
-            logger = structlog.get_logger()
-            logger.error("Failed to route WebSocket message",
-                         exchange=exchange, symbol=symbol,
-                         message_type=message_type, error=str(e))
-
-    # Store routing function for use by WebSocket handlers
-    from .services.websocket_server import websocket_server
-    websocket_server.message_router = route_websocket_message
-
-async def setup_exchange_subscriptions(exchange_slug: str, symbol: str):
-    """Налаштування підписок для біржі"""
+async def setup_exchange_bulk_subscriptions(exchange_slug: str, pairs: List[Dict],
+                                            stream_processor: StreamProcessor):
+    """Setup bulk subscriptions for an exchange efficiently"""
     logger = structlog.get_logger()
 
     try:
-        adapter = await exchange_manager.get_public_adapter(exchange_slug)
-        if not adapter:
-            logger.warning(f"No adapter for {exchange_slug}")
-            return
-
-        # Callback для обробки даних
-        async def data_callback(data):
-            """Обробка WebSocket даних"""
+        # Create callback for stream processor integration
+        async def data_callback(data: Dict[str, Any]):
+            """Process WebSocket data through stream processor"""
             try:
-                # Відправте дані до stream processor
-                if hasattr(app.state, 'stream_processor'):
-                    await app.state.stream_processor.process_message(
-                        exchange=exchange_slug,
-                        symbol=symbol,
-                        message_type=data.get('type', 'ticker'),
-                        data=data.get('data', {})
-                    )
-                    logger.debug("WebSocket data processed",
-                               exchange=exchange_slug, symbol=symbol)
+                await stream_processor.process_message(
+                    exchange=exchange_slug,
+                    symbol=data.get('symbol', ''),
+                    message_type=data.get('type', 'ticker'),
+                    data=data.get('data', {})
+                )
             except Exception as e:
                 logger.error("Failed to process WebSocket data",
-                           exchange=exchange_slug, symbol=symbol, error=str(e))
+                             exchange=exchange_slug, error=str(e))
 
-        if hasattr(adapter, 'websocket') and adapter.websocket:
-            success = await adapter.websocket.subscribe_ticker(symbol, data_callback)
-            if success:
-                logger.info("Subscribed to ticker", exchange=exchange_slug, symbol=symbol)
-            else:
-                logger.error("Failed to subscribe to ticker", exchange=exchange_slug, symbol=symbol)
+        subscriptions = []
+
+        for pair in pairs:
+            symbol = pair['symbol']
+
+            essential_streams = [
+                {
+                    'exchange': exchange_slug,
+                    'symbol': symbol,
+                    'stream_type': 'ticker',
+                    'callback': data_callback
+                },
+                {
+                    'exchange': exchange_slug,
+                    'symbol': symbol,
+                    'stream_type': 'orderbook',
+                    'callback': data_callback
+                }
+            ]
+
+            key_timeframes = ['1m', '5m', '15m', '1h', '4h', '1d']
+            for timeframe in key_timeframes:
+                essential_streams.append({
+                    'exchange': exchange_slug,
+                    'symbol': symbol,
+                    'stream_type': 'klines',
+                    'timeframe': timeframe,
+                    'callback': data_callback
+                })
+
+            subscriptions.extend(essential_streams)
+
+        logger.info("Starting bulk subscription",
+                    exchange=exchange_slug,
+                    pairs=len(pairs),
+                    total_subscriptions=len(subscriptions))
+
+        results = await exchange_manager.bulk_subscribe(subscriptions)
+
+        logger.info("Bulk subscription completed",
+                    exchange=exchange_slug,
+                    successful=len(results['successful']),
+                    failed=len(results['failed']))
+
+        # Log failures for debugging
+        if results['failed']:
+            for failure in results['failed'][:5]:  # Log first 5 failures
+                logger.warning("Subscription failed",
+                               exchange=exchange_slug,
+                               symbol=failure['subscription']['symbol'],
+                               stream_type=failure['subscription']['stream_type'],
+                               error=failure['error'])
 
     except Exception as e:
-        logger.error("Failed to setup subscription",
-                   exchange=exchange_slug, symbol=symbol, error=str(e))
+        logger.error("Failed to setup bulk subscriptions",
+                     exchange=exchange_slug, error=str(e))
+
+
+async def setup_websocket_integration(stream_processor: StreamProcessor):
+    """Setup WebSocket message routing to stream processor"""
+    logger = structlog.get_logger()
+
+    try:
+        # Setup WebSocket server integration
+        from .services.websocket_server import websocket_server
+
+        # Create routing function for WebSocket messages
+        async def route_websocket_message(exchange: str, symbol: str, message_type: str, data: dict):
+            """Route WebSocket message to stream processor"""
+            try:
+                await stream_processor.process_message(exchange, symbol, message_type, data)
+            except Exception as e:
+                logger.error("Failed to route WebSocket message",
+                             exchange=exchange, symbol=symbol,
+                             message_type=message_type, error=str(e))
+
+        # Store routing function for use by WebSocket handlers
+        websocket_server.message_router = route_websocket_message
+
+        logger.info("WebSocket integration setup complete")
+
+    except Exception as e:
+        logger.error("Failed to setup WebSocket integration", error=str(e))
+        raise
+
+
+async def add_trading_pair_subscriptions(exchange_slug: str, symbol: str,
+                                         stream_processor: StreamProcessor) -> Dict[str, Any]:
+    """Add subscriptions for a new trading pair"""
+    logger = structlog.get_logger()
+
+    async def data_callback(data: Dict[str, Any]):
+        await stream_processor.process_message(
+            exchange=exchange_slug,
+            symbol=symbol,
+            message_type=data.get('type', 'ticker'),
+            data=data.get('data', {})
+        )
+
+    subscriptions = [
+        {
+            'exchange': exchange_slug,
+            'symbol': symbol,
+            'stream_type': 'ticker',
+            'callback': data_callback
+        },
+        {
+            'exchange': exchange_slug,
+            'symbol': symbol,
+            'stream_type': 'orderbook',
+            'callback': data_callback
+        }
+    ]
+
+    # Add klines for key timeframes
+    for timeframe in ['1m', '5m', '1h', '1d']:
+        subscriptions.append({
+            'exchange': exchange_slug,
+            'symbol': symbol,
+            'stream_type': 'klines',
+            'timeframe': timeframe,
+            'callback': data_callback
+        })
+
+    results = await exchange_manager.bulk_subscribe(subscriptions)
+
+    logger.info("Added subscriptions for new trading pair",
+                exchange=exchange_slug, symbol=symbol,
+                successful=len(results['successful']),
+                failed=len(results['failed']))
+
+    return results
+
+
+async def remove_trading_pair_subscriptions(exchange_slug: str, symbol: str) -> Dict[str, Any]:
+    """Remove subscriptions for a trading pair"""
+    logger = structlog.get_logger()
+
+    try:
+        # Get current subscriptions
+        stats = await exchange_manager.get_subscription_stats()
+        exchange_subscriptions = stats.get('by_exchange', {}).get(exchange_slug, {}).get('subscriptions', [])
+
+        # Find subscriptions for this symbol
+        symbol_subscriptions = [
+            sub for sub in exchange_subscriptions
+            if f":{symbol}:" in sub
+        ]
+
+        # Remove subscriptions
+        removal_results = []
+        for subscription_key in symbol_subscriptions:
+            success = await exchange_manager.unsubscribe_from_stream(subscription_key)
+            removal_results.append({
+                'subscription_key': subscription_key,
+                'success': success
+            })
+
+        successful_removals = sum(1 for r in removal_results if r['success'])
+
+        logger.info("Removed subscriptions for trading pair",
+                    exchange=exchange_slug, symbol=symbol,
+                    total_subscriptions=len(symbol_subscriptions),
+                    successful_removals=successful_removals)
+
+        return {
+            'total_subscriptions': len(symbol_subscriptions),
+            'successful_removals': successful_removals,
+            'failed_removals': len(symbol_subscriptions) - successful_removals,
+            'details': removal_results
+        }
+
+    except Exception as e:
+        logger.error("Failed to remove subscriptions",
+                     exchange=exchange_slug, symbol=symbol, error=str(e))
+        return {
+            'error': str(e),
+            'total_subscriptions': 0,
+            'successful_removals': 0,
+            'failed_removals': 0
+        }
+
+
+async def get_subscription_health_status() -> Dict[str, Any]:
+    """Get comprehensive subscription health status"""
+    try:
+        stats = await exchange_manager.get_subscription_stats()
+
+        health_status = {
+            'overall_health': 'healthy',
+            'total_subscriptions': stats['total_subscriptions'],
+            'exchanges': {},
+            'issues': []
+        }
+
+        # Check each exchange
+        for exchange, info in stats['by_exchange'].items():
+            ws_info = stats['websocket_connections'][exchange]
+
+            exchange_health = {
+                'subscriptions': info['count'],
+                'websocket_connected': ws_info['connected'],
+                'adapter_available': ws_info['adapter_available'],
+                'status': 'healthy'
+            }
+
+            # Determine exchange health
+            if not ws_info['connected'] or not ws_info['adapter_available']:
+                exchange_health['status'] = 'unhealthy'
+                health_status['issues'].append(f"{exchange}: WebSocket connection issues")
+            elif info['count'] == 0:
+                exchange_health['status'] = 'degraded'
+                health_status['issues'].append(f"{exchange}: No active subscriptions")
+
+            health_status['exchanges'][exchange] = exchange_health
+
+        # Determine overall health
+        unhealthy_exchanges = sum(1 for ex in health_status['exchanges'].values()
+                                  if ex['status'] == 'unhealthy')
+
+        if unhealthy_exchanges > 0:
+            health_status['overall_health'] = 'degraded' if unhealthy_exchanges == 1 else 'unhealthy'
+
+        return health_status
+
+    except Exception as e:
+        return {
+            'overall_health': 'unhealthy',
+            'error': str(e),
+            'total_subscriptions': 0,
+            'exchanges': {},
+            'issues': ['Failed to get health status']
+        }
 
 # Create app instance
 app = create_app()
